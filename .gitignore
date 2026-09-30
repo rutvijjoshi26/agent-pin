@@ -1,0 +1,7 @@
+.build/
+.agent-pin-test/
+.install-test/
+dist/
+apps/desktop/node_modules/
+apps/desktop/src-tauri/target/
+.DS_Store

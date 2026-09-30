@@ -1,0 +1,74 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__REPO__/bin/agent-pin-status codex running session-start",
+            "statusMessage": "Updating Agent Pin"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__REPO__/bin/agent-pin-status codex running prompt",
+            "statusMessage": "Updating Agent Pin"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__REPO__/bin/agent-pin-status codex running tool",
+            "statusMessage": "Updating Agent Pin"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__REPO__/bin/agent-pin-status codex waiting_approval approval",
+            "statusMessage": "Updating Agent Pin"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__REPO__/bin/agent-pin-status codex running post-tool",
+            "statusMessage": "Updating Agent Pin"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__REPO__/bin/agent-pin-status codex completed stop",
+            "statusMessage": "Updating Agent Pin"
+          }
+        ]
+      }
+    ]
+  }
+}

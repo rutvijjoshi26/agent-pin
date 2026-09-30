@@ -1,0 +1,217 @@
+:root {
+  color-scheme: dark;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: transparent;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+body {
+  display: block;
+}
+
+.pin {
+  width: 100vw;
+  height: 100vh;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  color: rgba(255, 255, 255, 0.92);
+  background: rgba(0, 0, 0, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 8px;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.26);
+  user-select: none;
+}
+
+.pin.is-collapsed {
+  padding: 10px 9px;
+}
+
+.pin.is-collapsed [data-expanded-only] {
+  display: none;
+}
+
+.pin__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 16px;
+  margin-bottom: 8px;
+}
+
+.pin__mark {
+  width: 16px;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.82);
+}
+
+.pin__title {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.agents {
+  display: grid;
+  gap: 6px;
+}
+
+.setup {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.setup__top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.setup__title {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  line-height: 14px;
+  font-weight: 700;
+}
+
+.setup__button {
+  height: 22px;
+  padding: 0 7px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 5px;
+  color: rgba(255, 255, 255, 0.94);
+  background: rgba(255, 255, 255, 0.12);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.setup__button:disabled {
+  opacity: 0.56;
+}
+
+.setup__detail {
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 9px;
+  line-height: 12px;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.agent {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+}
+
+.pin.is-collapsed .agent {
+  height: 18px;
+}
+
+.agent__dot {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 800;
+  color: #050505;
+}
+
+.agent__initial {
+  width: 10px;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 800;
+  color: rgba(255, 255, 255, 0.86);
+}
+
+.agent__body {
+  min-width: 0;
+  flex: 1;
+}
+
+.agent__top {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.agent__name,
+.agent__status {
+  font-size: 11px;
+  line-height: 13px;
+  font-weight: 700;
+}
+
+.agent__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent__status {
+  margin-left: auto;
+}
+
+.agent__secondary {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 9px;
+  line-height: 11px;
+  color: rgba(255, 255, 255, 0.56);
+}
+
+.is-idle .agent__dot {
+  background: #858b91;
+}
+
+.is-running .agent__dot {
+  background: #29ad5c;
+}
+
+.is-running .agent__status {
+  color: #29ad5c;
+}
+
+.is-waiting .agent__dot {
+  background: #f2ad33;
+}
+
+.is-waiting .agent__status {
+  color: #f2ad33;
+}
+
+.is-completed .agent__dot {
+  background: #397ae0;
+}
+
+.is-completed .agent__status {
+  color: #397ae0;
+}
+
+.is-error .agent__dot {
+  background: #e0333d;
+}
+
+.is-error .agent__status {
+  color: #e0333d;
+}

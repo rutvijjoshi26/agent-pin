@@ -1,0 +1,50 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "fileutils"
+require "time"
+
+VALID_PROVIDERS = %w[claude codex antigravity].freeze
+VALID_STATUSES = %w[idle running waiting_approval completed error].freeze
+
+provider = ARGV[0].to_s
+status = ARGV[1].to_s
+detail = ARGV[2].to_s
+
+unless VALID_PROVIDERS.include?(provider) && VALID_STATUSES.include?(status)
+  warn "usage: agent-pin-status <claude|codex|antigravity> <idle|running|waiting_approval|completed|error> [detail]"
+  exit 2
+end
+
+stdin = STDIN.read.to_s
+input = stdin.strip.empty? ? {} : JSON.parse(stdin)
+
+state_dir = ENV.fetch("AGENT_PIN_HOME", File.join(Dir.home, ".agent-pin"))
+event_file = File.join(state_dir, "events.jsonl")
+FileUtils.mkdir_p(state_dir)
+
+hook_event = input["hook_event_name"] || ENV["HOOK_EVENT_NAME"] || ENV["CLAUDE_HOOK_EVENT_NAME"]
+cwd = input["cwd"] || Dir.pwd
+
+tool_name =
+  input["tool_name"] ||
+  input.dig("tool", "name") ||
+  input.dig("request", "tool_name") ||
+  input.dig("tool_input", "name")
+
+event = {
+  provider: provider,
+  status: status,
+  cwd: cwd,
+  detail: [detail, hook_event, tool_name].compact.reject(&:empty?).join(" "),
+  event: hook_event,
+  tool_name: tool_name,
+  session_id: input["session_id"],
+  timestamp: Time.now.to_i
+}
+
+File.open(event_file, "a") do |file|
+  file.flock(File::LOCK_EX)
+  file.puts(JSON.generate(event))
+end

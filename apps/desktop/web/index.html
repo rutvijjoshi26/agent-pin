@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agent Pin</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main id="pin" class="pin" data-tauri-drag-region>
+      <header class="pin__header" data-tauri-drag-region>
+        <span class="pin__mark" data-tauri-drag-region>⌖</span>
+        <span class="pin__title" data-expanded-only data-tauri-drag-region>Agent Pin</span>
+      </header>
+      <section id="agents" class="agents" data-tauri-drag-region></section>
+      <section id="setup" class="setup" data-expanded-only hidden>
+        <div class="setup__top">
+          <span id="setup-title" class="setup__title">Setup needed</span>
+          <button id="setup-button" class="setup__button" type="button">Set up</button>
+        </div>
+        <div id="setup-detail" class="setup__detail">Claude/Codex hooks are missing.</div>
+      </section>
+    </main>
+    <script src="./main.js"></script>
+  </body>
+</html>
