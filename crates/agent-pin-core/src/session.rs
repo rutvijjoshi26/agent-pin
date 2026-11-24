@@ -232,10 +232,21 @@ fn push_capped<T>(list: &mut Vec<T>, item: T) {
 /// count as absolute on every platform, and the filesystem is not touched.
 fn absolute(cwd: Option<&str>, path: &str) -> String {
     match cwd {
-        Some(cwd) if !is_absolute(path) => {
-            std::path::Path::new(cwd).join(path).to_string_lossy().into_owned()
-        }
+        Some(cwd) if !is_absolute(path) => join(cwd, path),
         _ => path.to_owned(),
+    }
+}
+
+/// Joins `path` onto `cwd` with the cwd's own separator style (`\` when the
+/// cwd uses only backslashes, else `/`), so the result is the same on every
+/// host OS. `Path::join` would use the host separator, which breaks
+/// cross-session collision keys.
+fn join(cwd: &str, path: &str) -> String {
+    let sep = if cwd.contains('\\') && !cwd.contains('/') { '\\' } else { '/' };
+    if cwd.ends_with(['/', '\\']) {
+        format!("{cwd}{path}")
+    } else {
+        format!("{cwd}{sep}{path}")
     }
 }
 
@@ -251,6 +262,14 @@ fn is_absolute(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join_uses_cwd_separator_style() {
+        assert_eq!(absolute(Some(r"C:\code\web"), r"src\a.rs"), r"C:\code\web\src\a.rs");
+        assert_eq!(absolute(Some("/r"), "src/a.rs"), "/r/src/a.rs");
+        assert_eq!(absolute(Some("/r/"), "a.rs"), "/r/a.rs");
+        assert_eq!(absolute(Some(r"C:\code\"), "a.rs"), r"C:\code\a.rs");
+    }
 
     fn input() -> HookInput {
         HookInput {
