@@ -25,6 +25,7 @@ Agent Pin pulls that state out of the terminals and into one small window that s
   ```
 
 - **Collision warnings.** When two sessions edited the same file within 10 minutes, both rows say so. Sessions of the same agent in the same project are told apart with a ` #xxxx` suffix (the first characters of the session id).
+- **Allow and Deny from the pin.** When Claude Code or Codex asks for permission, the session's row offers **Allow** and **Deny**. See [Approve from Agent Pin](#approve-from-agent-pin).
 
 ## Install
 
@@ -36,7 +37,7 @@ Agent Pin pulls that state out of the terminals and into one small window that s
    ```
 
    Hooks are only installed for agents whose config directory already exists (`~/.claude` for Claude Code, `~/.codex` for Codex). They are merged into `~/.claude/settings.json` and `~/.codex/hooks.json`.
-3. **Claude Code:** run `/hooks` to review and trust the new hooks. **Codex:** restart it, since it only loads hooks at session start.
+3. **Claude Code:** edits to `settings.json` are picked up automatically; you can optionally check the new hooks in `/hooks`, which is a read-only browser. **Codex:** run `/hooks` to trust the new hooks.
 
 The installer is careful with your config. It backs the file up to `<file>.agent-pin-backup-<timestamp>` before writing, writes atomically, keeps your key order, never removes a hook it didn't install, and skips the write entirely when nothing would change. Re-running it is safe.
 
@@ -73,9 +74,58 @@ Agent Pin overlay
 
 Each hook event updates one small JSON file per session under `~/.agent-pin/sessions/`. Set `AGENT_PIN_HOME` to use a different directory. While running, the app deletes session files that haven't changed in 3 days.
 
-The hook can never block an agent. Claude Code hooks are installed with `"async": true`, and `agent-pin hook` always exits 0: it waits at most about 2 seconds for its input, and reports any error only on stderr. Codex hooks are installed without `async`.
+`agent-pin hook` always exits 0: it waits at most about 2 seconds for its input, and reports any error only on stderr. Claude Code hooks are installed with `"async": true`, except `PermissionRequest`, which is synchronous with a 600 s timeout so it can return an Allow or Deny (see [Approve from Agent Pin](#approve-from-agent-pin)). Codex hooks are installed without `async`, and its `PermissionRequest` hook has the same 600 s timeout. Every other event returns as soon as it is recorded.
 
 One deliberate choice worth noting: Claude's `Notification` hook is **not** used to detect approval waits, because Claude also fires notifications after a run completes, which makes the signal ambiguous. Approval waits come from `PermissionRequest` instead.
+
+## Approve from Agent Pin
+
+When Claude Code or Codex asks for permission, the session's row shows the request with **Allow** and **Deny** buttons. It shows the request's summary, for example `Bash: rm -rf build`, and below the buttons the tool's input as formatted JSON in a scrollable box, every line of it. Formatted input longer than 4000 characters is cut short; a request cut short cannot be allowed from Agent Pin. Its card says "Too long to show in full. Answer in the terminal." and offers **Deny** only. The buttons stay if the row flips back to running while the request waits, which subagents and parallel tool calls can cause. They are hidden while the pin is collapsed to status dots.
+
+### How it works
+
+- The installed `PermissionRequest` hook writes a request file to `~/.agent-pin/approvals/` (or `$AGENT_PIN_HOME/approvals/`) and waits for the app. A click writes a decision file next to it, which the hook reads within 200 ms and passes to the agent. A Deny carries the message "Denied from Agent Pin".
+- Nothing listens on the network. The hook and the app share files only.
+- The first click is final. Both buttons are disabled once you click, and the app never replaces a decision that has been written.
+- A click affects only the request shown on that card. Each request has its own id. If one session has several requests at once, its row shows the newest.
+
+### When the agent asks in its own prompt instead
+
+The hook prints nothing, and the agent falls back to its normal permission prompt, when:
+
+- **Agent Pin isn't running.** The app refreshes `app.alive` in the state directory every second, and the hook treats a file 3 s old as a stopped app. A hook started without the app returns at once. One that is waiting when the app quits or crashes returns within about 3 s.
+- **Approvals are switched off.** Untick **Approve from Agent Pin** in the setup panel. This takes effect at once: a hook that is already waiting checks the switch on every 200 ms poll, returns with no decision and removes its request, so its card goes away and the agent shows its normal prompt.
+- **The agent is asking a question or for plan approval** (Claude Code's `AskUserQuestion` and `ExitPlanMode`). These need an answer, not just Allow, so they always stay in the terminal and their row shows no buttons.
+- **No click within about 10 minutes.** The hook gives up after 590 s, inside its 600 s timeout.
+- **The card is dropped.** The app drops a request when its session has completed, gone idle or errored, and when its hook has stopped refreshing the request file for about 5 s (the hook refreshes it every 200 ms while it waits). A waiting hook whose request is dropped returns with no decision.
+- **Anything goes wrong**, such as a file that can't be written or read, or a decision file that isn't exactly an Allow or a Deny.
+
+The hook never decides on its own. It only passes on a click.
+
+### Interactive sessions and headless runs
+
+In an interactive terminal session, the terminal also shows its own permission prompt, and whichever is answered first is used.
+
+After you answer in the terminal, the card may stay until the session finishes. Clicking it then has no effect.
+
+Headless runs (`claude -p`) and background sessions have no prompt to answer, so they wait for a click whenever the app is running and approvals are on. To get their normal behaviour back, which in headless mode is a denial, switch approvals off; a run already waiting is released at once.
+
+The Claude Code headless docs ([Run Claude Code programmatically](https://code.claude.com/docs/en/headless)) say: "In a Manual mode `claude -p` run, a call that needs approval is denied unless something approves it, such as a `PermissionRequest` hook or a `--permission-prompt-tool`." The hooks reference ([Hooks](https://code.claude.com/docs/en/hooks)) says the same for a `-p` run with no permission host: nobody can answer the prompt, so a call that would prompt is denied unless something, such as a `PermissionRequest` hook, approves it. That is the behaviour Agent Pin relies on. Other permission modes (for example `dontAsk` or `acceptEdits`) change which calls prompt at all, so a click is only asked for calls that would otherwise prompt.
+
+### Settings and Codex
+
+- An Allow never overrides a `deny` rule in your Claude Code settings. The hooks reference says a `PermissionRequest` hook cannot approve a call that a deny rule refuses, unless an installed Claude Code mod overrides the rule ([Hooks](https://code.claude.com/docs/en/hooks); see also [Precedence among rules, hooks, and mods](https://code.claude.com/docs/en/permissions#precedence-among-rules-hooks-and-mods)).
+- Codex is supported through its `PermissionRequest` hook. The Codex hooks docs ([Hooks](https://learn.chatgpt.com/docs/hooks), which `https://developers.openai.com/codex/hooks` redirects to) say that non-managed hooks must be reviewed and trusted before they run, and that new or changed hooks are marked for review and skipped until trusted. After **Set up**, run `/hooks` in Codex to trust the updated hook. Until you do, Codex skips it and prompts as usual.
+
+### Upgrading
+
+The installed `PermissionRequest` command carries a `--wait` argument (`agent-pin hook <provider> PermissionRequest --wait`). Only a hook with that marker posts a request and waits; without it the hook returns at once with no output, exactly as before approvals existed. So an old install whose async entry now runs this newer binary never waits for a click Claude would ignore, and it shows as needing an update until you reinstall.
+
+Hooks installed by an older Agent Pin show "<Agent> hooks need updating" in the setup panel until you click **Update**. The update makes Claude Code's `PermissionRequest` hook synchronous with a 600 s timeout (an async hook can't return a decision), gives Codex's the same timeout, and keeps your own hooks. Claude Code picks the change up automatically (you can optionally check it in `/hooks`); Codex users run `/hooks` to trust it.
+
+### Platforms
+
+Approvals use only files, no sockets or signals, so they work the same way on macOS, Windows and Linux. The hook, the request and decision files, and the installer have tests that run in CI on all three.
 
 ## Adding another agent
 
@@ -85,7 +135,11 @@ Any provider id works (lowercase letters, digits and dashes). Point the agent's 
 agent-pin hook <id> <EventName>
 ```
 
-using Claude-style event names (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `StopFailure`, `SessionEnd`), with the hook's JSON payload on stdin. For example, `agent-pin hook antigravity PermissionRequest`.
+using Claude-style event names (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `StopFailure`, `SessionEnd`), with the hook's JSON payload on stdin. For example, `agent-pin hook antigravity PermissionRequest` (add `--wait` to take part in approvals).
+
+The tools `AskUserQuestion` and `ExitPlanMode` are never offered for approval: Claude Code needs an `updatedInput` alongside an allow for them (see the [Hooks](https://code.claude.com/docs/en/hooks) reference), which a plain Allow would not carry, so they keep their normal terminal prompt.
+
+A `PermissionRequest` with the `--wait` argument that names a tool waits for Allow or Deny for any provider, as described in [Approve from Agent Pin](#approve-from-agent-pin), and prints the decision in Claude Code's format. Give that hook a timeout of at least 600 s, or switch approvals off if your agent can't use the decision.
 
 ## Linux
 

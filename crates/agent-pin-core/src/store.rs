@@ -174,7 +174,7 @@ fn prune_orphan_lock(sessions: &Path, stem: &str, path: &Path, max_age: Duration
 }
 
 /// True when `path`'s mtime is more than `max_age` before the system clock.
-fn older_than(path: &Path, max_age: Duration) -> bool {
+pub(crate) fn older_than(path: &Path, max_age: Duration) -> bool {
     fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
@@ -269,7 +269,7 @@ fn still_linked(_file: &File, path: &Path) -> bool {
 
 /// Accepts only non-empty stems of `[A-Za-z0-9_-]`, so a stem can never
 /// name a path outside the sessions dir on any platform.
-fn check_stem(stem: &str) -> io::Result<()> {
+pub(crate) fn check_stem(stem: &str) -> io::Result<()> {
     let ok = !stem.is_empty()
         && stem
             .chars()
@@ -277,7 +277,7 @@ fn check_stem(stem: &str) -> io::Result<()> {
     if !ok {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("invalid session key: {stem:?}"),
+            "invalid id",
         ));
     }
     Ok(())
@@ -296,21 +296,57 @@ fn read_state(path: &Path) -> io::Result<Option<SessionState>> {
 /// Writes `state` to a unique temp file in `sessions`, then renames it over
 /// `path`.
 fn write_atomic(sessions: &Path, stem: &str, path: &Path, state: &SessionState) -> io::Result<()> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = sessions.join(format!("{stem}.json.tmp-{}-{n}", std::process::id()));
-    let result = (|| {
-        let body = serde_json::to_vec(state).map_err(io::Error::other)?;
-        let mut file = File::create(&tmp)?;
-        file.write_all(&body)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, path)
-    })();
+    let body = serde_json::to_vec(state).map_err(io::Error::other)?;
+    write_bytes_atomic(sessions, &format!("{stem}.json"), path, &body)
+}
+
+/// Writes `body` to a unique temp file `<dir>/<name>.tmp-<pid>-<n>`, syncs
+/// it, then renames it over `path` (which must be in `dir`). The temp file
+/// is removed on failure.
+pub(crate) fn write_bytes_atomic(dir: &Path, name: &str, path: &Path, body: &[u8]) -> io::Result<()> {
+    let tmp = temp_path(dir, name);
+    let result = write_synced(&mut File::create(&tmp)?, body).and_then(|()| fs::rename(&tmp, path));
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// Publishes `body` as `<dir>/<name>` only if nothing is there yet: writes a
+/// synced temp file and hard-links it into place (failing with
+/// `AlreadyExists` if the target exists), then removes the temp. Where hard
+/// links fail for another reason, falls back to `create_new` and writes the
+/// target directly (not atomic for readers).
+pub(crate) fn publish_new(dir: &Path, name: &str, body: &[u8]) -> io::Result<()> {
+    let path = dir.join(name);
+    let tmp = temp_path(dir, name);
+    let linked = write_synced(&mut File::create(&tmp)?, body).and_then(|()| fs::hard_link(&tmp, &path));
+    let _ = fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
+        Err(_) => {
+            let mut file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+            let result = write_synced(&mut file, body);
+            if result.is_err() {
+                drop(file);
+                let _ = fs::remove_file(&path);
+            }
+            result
+        }
+    }
+}
+
+/// A unique temp path `<dir>/<name>.tmp-<pid>-<n>`.
+fn temp_path(dir: &Path, name: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("{name}.tmp-{}-{n}", std::process::id()))
+}
+
+fn write_synced(file: &mut File, body: &[u8]) -> io::Result<()> {
+    file.write_all(body)?;
+    file.sync_all()
 }
 
 #[cfg(test)]

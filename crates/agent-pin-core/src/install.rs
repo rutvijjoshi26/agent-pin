@@ -1,6 +1,7 @@
 //! Hook installer: merges agent-pin hook entries into the user's provider
 //! config files without touching the user's own hooks.
 
+use serde::Serialize;
 use serde_json::Value;
 use std::ffi::OsString;
 use std::fs;
@@ -13,6 +14,7 @@ pub struct Provider {
     /// Config file path relative to the user's home directory.
     pub config_rel: &'static str,
     pub events: &'static [&'static str],
+    /// Install hooks with `"async": true` (never for PermissionRequest).
     pub async_hooks: bool,
 }
 
@@ -48,11 +50,18 @@ pub const PROVIDERS: &[Provider] = &[
     },
 ];
 
-/// The shell command installed for one hook: `"<exe>" hook <provider> <event>`.
+/// The marker argument that makes a PermissionRequest hook post to the app
+/// and wait for a click. Without it the hook returns at once, so an install
+/// from before approvals (same exe, async entry) never waits for nothing.
+pub const WAIT_MARKER: &str = "--wait";
+
+/// The shell command installed for one hook: `"<exe>" hook <provider> <event>`,
+/// plus ` --wait` ([`WAIT_MARKER`]) for PermissionRequest.
 /// The exe is wrapped in double quotes with inner `"` escaped; backslashes are
 /// left alone so Windows paths stay valid.
 pub fn hook_command(exe: &Path, provider: &str, event: &str) -> String {
-    format!("{}{provider} {event}", exe_prefix(exe))
+    let marker = if event == "PermissionRequest" { format!(" {WAIT_MARKER}") } else { String::new() };
+    format!("{}{provider} {event}{marker}", exe_prefix(exe))
 }
 
 /// True for commands agent-pin installed: the legacy Ruby `agent-pin-status`
@@ -75,13 +84,19 @@ pub fn is_agent_pin_command(cmd: &str) -> bool {
 }
 
 /// The exe of a command shaped exactly like [`hook_command`] output:
-/// `"<exe>" hook <provider> <event>` with nothing after the event.
+/// `"<exe>" hook <provider> <event>` with at most the [`WAIT_MARKER`] after
+/// the event.
 fn quoted_hook_exe(cmd: &str) -> Option<&str> {
     let rest = cmd.strip_prefix('"')?;
     let end = rest.find("\" hook ")?;
     let args: Vec<&str> = rest[end + "\" hook ".len()..].split(' ').collect();
     let word = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-    (args.len() == 2 && args.iter().all(|w| word(w))).then_some(&rest[..end])
+    let shaped = match args.len() {
+        2 => true,
+        3 => args[2] == WAIT_MARKER,
+        _ => false,
+    };
+    (shaped && args.iter().all(|w| word(w))).then_some(&rest[..end])
 }
 
 /// True for an entry agent-pin owns: [`is_agent_pin_command`], or a hook
@@ -136,20 +151,12 @@ pub fn merge(config: &mut Value, provider: &Provider, exe: &Path) {
     });
 
     for event in provider.events {
-        let mut entry = serde_json::Map::new();
-        entry.insert("type".into(), "command".into());
-        entry.insert(
-            "command".into(),
-            hook_command(exe, provider.id, event).into(),
-        );
-        if provider.async_hooks {
-            entry.insert("async".into(), true.into());
-        }
+        let entry = hook_entry(provider, event, exe);
         let mut group = serde_json::Map::new();
         if *event != "UserPromptSubmit" && *event != "Stop" {
             group.insert("matcher".into(), "*".into());
         }
-        group.insert("hooks".into(), Value::Array(vec![Value::Object(entry)]));
+        group.insert("hooks".into(), Value::Array(vec![entry]));
 
         let slot = hooks
             .entry(*event)
@@ -161,6 +168,25 @@ pub fn merge(config: &mut Value, provider: &Provider, exe: &Path) {
             .expect("array")
             .push(Value::Object(group));
     }
+}
+
+/// Seconds the agent lets a PermissionRequest hook run: it may wait for a
+/// click in Agent Pin for up to 590 s.
+const PERMISSION_TIMEOUT_SECS: u64 = 600;
+
+/// The hook entry agent-pin installs for `event`. PermissionRequest is
+/// synchronous (an async hook cannot return a decision) with a 600 s
+/// timeout; other events are async where the provider supports it.
+fn hook_entry(provider: &Provider, event: &str, exe: &Path) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("type".into(), "command".into());
+    entry.insert("command".into(), hook_command(exe, provider.id, event).into());
+    if event == "PermissionRequest" {
+        entry.insert("timeout".into(), PERMISSION_TIMEOUT_SECS.into());
+    } else if provider.async_hooks {
+        entry.insert("async".into(), true.into());
+    }
+    Value::Object(entry)
 }
 
 /// The exe to install as the hook command. Inside an AppImage, `current`
@@ -242,33 +268,76 @@ pub fn install(home: &Path, exe: &Path, now_secs: i64) -> Result<Vec<String>, St
     Ok(ids)
 }
 
-/// One entry per provider whose config directory exists: true when its config
-/// holds exactly the command [`hook_command`] builds for `exe` for every event
-/// the provider uses. Hooks pointing at a moved or older exe read as false.
-pub fn installed(home: &Path, exe: &Path) -> Vec<(String, bool)> {
+/// How a provider's config matches the hooks [`merge`] would install.
+/// Serializes as `"missing"`, `"stale"` or `"current"`.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum HookStatus {
+    /// No agent-pin command at all.
+    Missing,
+    /// Some agent-pin command, but not exactly the current entries: hooks
+    /// pointing at a moved or older exe, the legacy Ruby script, or older
+    /// settings such as an async PermissionRequest.
+    Stale,
+    /// Exactly the entry [`merge`] installs for `exe`, for every event the
+    /// provider uses.
+    Current,
+}
+
+/// One entry per provider whose config directory exists. A missing,
+/// blank or unparsable config reads as [`HookStatus::Missing`].
+pub fn status(home: &Path, exe: &Path) -> Vec<(String, HookStatus)> {
     PROVIDERS
         .iter()
         .filter(|provider| provider_dir_exists(home, provider))
         .map(|provider| {
             let config = read_config(&home.join(provider.config_rel)).ok().flatten();
-            let ok = config.is_some_and(|config| {
-                provider.events.iter().all(|event| {
-                    let want = hook_command(exe, provider.id, event);
-                    event_commands(&config, event).any(|cmd| cmd == want)
-                })
-            });
-            (provider.id.to_string(), ok)
+            let status = match config {
+                None => HookStatus::Missing,
+                Some(config) => config_status(&config, provider, exe),
+            };
+            (provider.id.to_string(), status)
         })
         .collect()
 }
 
-fn event_commands<'a>(config: &'a Value, event: &str) -> impl Iterator<Item = &'a str> {
+fn config_status(config: &Value, provider: &Provider, exe: &Path) -> HookStatus {
+    let current = provider.events.iter().all(|event| {
+        let want = hook_entry(provider, event, exe);
+        event_entries(config, event).any(|entry| *entry == want)
+    });
+    if current {
+        return HookStatus::Current;
+    }
+    let any_ours = config["hooks"]
+        .as_object()
+        .into_iter()
+        .flat_map(|events| events.keys())
+        .flat_map(|event| event_entries(config, event))
+        .filter_map(|entry| entry["command"].as_str())
+        .any(|cmd| is_ours(cmd, exe));
+    if any_ours {
+        HookStatus::Stale
+    } else {
+        HookStatus::Missing
+    }
+}
+
+/// One entry per provider whose config directory exists: true when its
+/// [`status`] is [`HookStatus::Current`].
+pub fn installed(home: &Path, exe: &Path) -> Vec<(String, bool)> {
+    status(home, exe)
+        .into_iter()
+        .map(|(id, status)| (id, status == HookStatus::Current))
+        .collect()
+}
+
+fn event_entries<'a>(config: &'a Value, event: &str) -> impl Iterator<Item = &'a Value> {
     config["hooks"][event]
         .as_array()
         .into_iter()
         .flatten()
         .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
-        .filter_map(|entry| entry["command"].as_str())
 }
 
 fn provider_dir_exists(home: &Path, provider: &Provider) -> bool {
@@ -444,7 +513,9 @@ mod tests {
             let entry = &group["hooks"][0];
             assert_eq!(entry["type"], "command");
             assert_eq!(entry["command"], hook_command(&exe(), "claude", event));
-            assert_eq!(entry["async"], Value::Bool(true), "{event}");
+            if *event != "PermissionRequest" {
+                assert_eq!(entry["async"], Value::Bool(true), "{event}");
+            }
             if *event == "UserPromptSubmit" || *event == "Stop" {
                 assert!(group.get("matcher").is_none(), "{event} must not have a matcher");
             } else {
@@ -465,6 +536,97 @@ mod tests {
             assert_eq!(entry["command"], hook_command(&exe(), "codex", event));
             assert!(entry.get("async").is_none(), "{event}: {entry}");
         }
+    }
+
+    /// The single agent-pin entry for `event`.
+    fn our_entry(config: &Value, event: &str) -> Value {
+        let entries = agent_pin_entries(config, event);
+        assert_eq!(entries.len(), 1, "{event}: {entries:?}");
+        entries[0].clone()
+    }
+
+    #[test]
+    fn claude_permission_request_is_sync_with_timeout_600() {
+        let mut config = Value::Object(Default::default());
+        merge(&mut config, claude(), &exe());
+        let entry = our_entry(&config, "PermissionRequest");
+        assert!(entry.get("async").is_none(), "{entry}");
+        assert_eq!(entry["timeout"], serde_json::json!(600));
+        assert_eq!(entry["command"], hook_command(&exe(), "claude", "PermissionRequest"));
+        assert_eq!(entry["type"], "command");
+    }
+
+    #[test]
+    fn codex_permission_request_timeout_600() {
+        let mut config = Value::Object(Default::default());
+        merge(&mut config, codex(), &exe());
+        let entry = our_entry(&config, "PermissionRequest");
+        assert!(entry.get("async").is_none(), "{entry}");
+        assert_eq!(entry["timeout"], serde_json::json!(600));
+        assert_eq!(entry["command"], hook_command(&exe(), "codex", "PermissionRequest"));
+    }
+
+    #[test]
+    fn other_events_unchanged() {
+        for provider in PROVIDERS {
+            let mut config = Value::Object(Default::default());
+            merge(&mut config, provider, &exe());
+            for event in provider.events.iter().filter(|e| **e != "PermissionRequest") {
+                let entry = our_entry(&config, event);
+                let mut want = serde_json::json!({
+                    "type": "command",
+                    "command": hook_command(&exe(), provider.id, event),
+                });
+                if provider.async_hooks {
+                    want["async"] = true.into();
+                }
+                assert_eq!(entry, want, "{} {event}", provider.id);
+            }
+        }
+    }
+
+    /// An install from before approvals: Claude's PermissionRequest entry is
+    /// async and has no timeout, beside a user's own hook.
+    fn old_async_install() -> Value {
+        let cmd = format!("{}claude PermissionRequest", exe_prefix(&exe()));
+        let mut config: Value = serde_json::from_str(SHARED_GROUP).unwrap();
+        merge(&mut config, claude(), &exe());
+        config["hooks"]["PermissionRequest"] = serde_json::json!([
+            {"matcher": "*", "hooks": [
+                {"type": "command", "command": USER_CMD},
+                {"type": "command", "command": cmd, "async": true},
+            ]}
+        ]);
+        config
+    }
+
+    #[test]
+    fn reinstall_migrates_async_permission_entry() {
+        let mut config = old_async_install();
+        merge(&mut config, claude(), &exe());
+        let entry = our_entry(&config, "PermissionRequest");
+        assert!(entry.get("async").is_none(), "{entry}");
+        assert_eq!(entry["timeout"], serde_json::json!(600));
+        assert!(commands(&config, "PermissionRequest").contains(&USER_CMD.to_string()));
+        assert!(commands(&config, "PreToolUse").contains(&USER_CMD.to_string()));
+        let once = config.clone();
+        merge(&mut config, claude(), &exe());
+        assert_eq!(config, once, "idempotent after migration");
+
+        // On disk: the old install reads as not installed, so Set up is
+        // offered again, and installing migrates it.
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir(home.path().join(".claude")).unwrap();
+        let settings = home.path().join(".claude/settings.json");
+        fs::write(&settings, serde_json::to_string_pretty(&old_async_install()).unwrap()).unwrap();
+        assert_eq!(installed(home.path(), &exe()), vec![("claude".to_string(), false)]);
+        install(home.path(), &exe(), 1).unwrap();
+        let written: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(written, once);
+        assert_eq!(installed(home.path(), &exe()), vec![("claude".to_string(), true)]);
+        let text = fs::read_to_string(&settings).unwrap();
+        install(home.path(), &exe(), 2).unwrap();
+        assert_eq!(fs::read_to_string(&settings).unwrap(), text, "reinstall writes nothing");
     }
 
     #[test]
@@ -718,5 +880,100 @@ mod tests {
         let target: Value =
             serde_json::from_str(&fs::read_to_string(dotfiles.join("settings.json")).unwrap()).unwrap();
         assert_eq!(agent_pin_entries(&target, "Stop").len(), 1);
+    }
+
+    fn claude_home(config: Option<&str>) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir(home.path().join(".claude")).unwrap();
+        if let Some(text) = config {
+            fs::write(home.path().join(".claude/settings.json"), text).unwrap();
+        }
+        home
+    }
+
+    #[test]
+    fn status_missing_without_agent_pin_commands() {
+        let user_only = serde_json::json!({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": USER_CMD}
+        ]}]}})
+        .to_string();
+        for config in [None, Some(""), Some(user_only.as_str())] {
+            let home = claude_home(config);
+            assert_eq!(
+                status(home.path(), &exe()),
+                vec![("claude".to_string(), HookStatus::Missing)],
+                "{config:?}"
+            );
+            assert_eq!(installed(home.path(), &exe()), vec![("claude".to_string(), false)]);
+        }
+        // A provider with no config directory is not listed at all.
+        assert!(status(tempfile::tempdir().unwrap().path(), &exe()).is_empty());
+    }
+
+    #[test]
+    fn status_current_after_install() {
+        let home = claude_home(None);
+        fs::create_dir(home.path().join(".codex")).unwrap();
+        install(home.path(), &exe(), 1).unwrap();
+        assert_eq!(
+            status(home.path(), &exe()),
+            vec![
+                ("claude".to_string(), HookStatus::Current),
+                ("codex".to_string(), HookStatus::Current)
+            ]
+        );
+    }
+
+    #[test]
+    fn status_stale_for_old_async_permission_entry() {
+        let text = serde_json::to_string_pretty(&old_async_install()).unwrap();
+        let home = claude_home(Some(&text));
+        assert_eq!(status(home.path(), &exe()), vec![("claude".to_string(), HookStatus::Stale)]);
+        assert_eq!(installed(home.path(), &exe()), vec![("claude".to_string(), false)]);
+    }
+
+    /// Timeout 600 and sync, but no `--wait` marker (the command an upgraded
+    /// binary would otherwise run as a waiting hook): Stale for both providers.
+    #[test]
+    fn status_stale_for_permission_entry_without_marker() {
+        for (provider, dir, file) in [("claude", ".claude", "settings.json"), ("codex", ".codex", "hooks.json")] {
+            let mut config = Value::Null;
+            let p = PROVIDERS.iter().find(|p| p.id == provider).unwrap();
+            merge(&mut config, p, &exe());
+            let want = hook_command(&exe(), provider, "PermissionRequest");
+            assert!(want.ends_with(" --wait"), "{want}");
+            let old = want.trim_end_matches(" --wait").to_string();
+            config["hooks"]["PermissionRequest"][0]["hooks"][0]["command"] = old.into();
+            let home = tempfile::tempdir().unwrap();
+            fs::create_dir(home.path().join(dir)).unwrap();
+            fs::write(home.path().join(dir).join(file), serde_json::to_string_pretty(&config).unwrap()).unwrap();
+            assert_eq!(status(home.path(), &exe()), vec![(provider.to_string(), HookStatus::Stale)], "{provider}");
+            install(home.path(), &exe(), 1).unwrap();
+            assert_eq!(status(home.path(), &exe()), vec![(provider.to_string(), HookStatus::Current)]);
+        }
+    }
+
+    #[test]
+    fn status_stale_after_exe_moved() {
+        let home = claude_home(None);
+        install(home.path(), &appimage(), 1).unwrap();
+        let moved = PathBuf::from("/home/u/Applications/Agent Pin_0.1.0_amd64.AppImage");
+        assert_eq!(status(home.path(), &moved), vec![("claude".to_string(), HookStatus::Stale)]);
+        assert_eq!(status(home.path(), &appimage()), vec![("claude".to_string(), HookStatus::Current)]);
+    }
+
+    #[test]
+    fn status_stale_for_legacy_only() {
+        let home = claude_home(Some(SHARED_GROUP));
+        assert_eq!(status(home.path(), &exe()), vec![("claude".to_string(), HookStatus::Stale)]);
+    }
+
+    #[test]
+    fn hook_status_serializes_lowercase() {
+        let names: Vec<String> = [HookStatus::Missing, HookStatus::Stale, HookStatus::Current]
+            .iter()
+            .map(|s| serde_json::to_string(s).unwrap())
+            .collect();
+        assert_eq!(names, ["\"missing\"", "\"stale\"", "\"current\""]);
     }
 }

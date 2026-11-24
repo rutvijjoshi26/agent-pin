@@ -14,12 +14,18 @@
       </header>
       <section id="agents" class="agents"></section>
       <section id="setup" class="setup" data-expanded-only hidden>
-        <div class="setup__top">
-          <span id="setup-title" class="setup__title">Setup needed</span>
-          <button id="setup-button" class="setup__button" type="button">Set up</button>
+        <div id="setup-note" class="setup__note" hidden>
+          <div class="setup__top">
+            <span id="setup-title" class="setup__title">Setup needed</span>
+            <button id="setup-button" class="setup__button" type="button">Set up</button>
+          </div>
+          <div id="setup-detail" class="setup__detail"></div>
+          <div id="setup-wayland" class="setup__detail" hidden>On Wayland, always-on-top may not be honored.</div>
         </div>
-        <div id="setup-detail" class="setup__detail"></div>
-        <div id="setup-wayland" class="setup__detail" hidden>On Wayland, always-on-top may not be honored.</div>
+        <label class="setup__toggle">
+          <input id="approvals-toggle" type="checkbox" checked />
+          <span>Approve from Agent Pin</span>
+        </label>
       </section>
     </main>
     <script type="module" src="./main.js"></script>

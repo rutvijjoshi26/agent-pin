@@ -130,7 +130,7 @@ fn labels(shown: &[&SessionState]) -> Vec<String> {
 }
 
 /// The cwd's last component, splitting on both `/` and `\`.
-fn project(cwd: Option<&str>) -> Option<String> {
+pub(crate) fn project(cwd: Option<&str>) -> Option<String> {
     cwd?
         .split(['/', '\\'])
         .rfind(|part| !part.is_empty())

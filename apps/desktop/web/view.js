@@ -108,35 +108,58 @@ export function isHeld(holdSince, nowMs) {
 
 const NO_CONFIG = "No Claude Code or Codex config found (~/.claude or ~/.codex)";
 
+// What to run after installing each provider's hooks.
+const TRUST_LINES = {
+  claude: "Claude: run /hooks in Claude Code to review and trust the hooks",
+  codex: "Codex: run /hooks in Codex to trust the updated hooks"
+};
+
 /**
- * The setup note after an install, from the provider ids it installed:
- * Claude needs its hooks trusted via /hooks; Codex alone just confirms.
+ * The setup note after an install, from the provider ids it installed: one
+ * line per installed provider saying how to trust its hooks.
  */
 export function installedNote(ids) {
   const list = Array.isArray(ids) ? ids : [];
   if (list.length === 0) {
     return { title: "No agents found", text: NO_CONFIG };
   }
-  if (list.includes("claude")) {
-    return { title: "Hooks installed", text: "Run /hooks in Claude Code to review and trust the new hooks" };
+  const lines = list.map((id) => TRUST_LINES[id] || `${capitalize(id)} hooks installed`);
+  return { title: "Hooks installed", text: lines.join("\n") };
+}
+
+// A provider's hook status; one without a status reads from `installed`.
+function hookStatus(provider) {
+  if (provider.status === "missing" || provider.status === "stale" || provider.status === "current") {
+    return provider.status;
   }
-  return { title: "Hooks installed", text: `${list.map(capitalize).join(" + ")} hooks installed` };
+  return provider.installed ? "current" : "missing";
 }
 
 /**
  * What the setup panel shows, from read_integrations' result (null when it
- * failed) and the current note ({ title, text } or null).
+ * failed) and the current note ({ title, text } or null). Missing hooks are
+ * offered "Set up"; hooks from an older Agent Pin are offered "Update".
  */
 export function setupView(integrations, note) {
   const providers = integrations && Array.isArray(integrations.providers) ? integrations.providers : null;
-  const missing = (providers || []).filter((provider) => !provider.installed).map((p) => capitalize(p.id));
+  const lines = [];
+  let anyMissing = false;
+  for (const provider of providers || []) {
+    const status = hookStatus(provider);
+    if (status === "missing") {
+      anyMissing = true;
+      lines.push(`${capitalize(provider.id)} hooks missing`);
+    } else if (status === "stale") {
+      lines.push(`${capitalize(provider.id)} hooks need updating`);
+    }
+  }
   const noConfig = providers !== null && providers.length === 0;
   const wayland = Boolean(integrations && integrations.wayland);
   let title = "Note";
   let detail = "";
-  if (missing.length > 0) {
-    title = "Setup needed";
-    detail = note ? note.text : `${missing.join(" + ")} hooks missing`;
+  if (lines.length > 0) {
+    title = anyMissing ? "Setup needed" : "Update needed";
+    detail = note ? note.text : lines.join("\n");
   } else if (note) {
     title = note.title;
     detail = note.text;
@@ -149,11 +172,193 @@ export function setupView(integrations, note) {
     title,
     detail,
     wayland,
-    button: missing.length > 0
+    button: lines.length > 0,
+    buttonLabel: lines.length > 0 && !anyMissing ? "Update" : "Set up"
   };
+}
+
+/**
+ * The pending approval request for a row (key `provider__session_key`), or
+ * null. With several, the newest by created_ms wins.
+ */
+export function approvalFor(rowKey, approvals) {
+  let best = null;
+  for (const req of Array.isArray(approvals) ? approvals : []) {
+    if (`${req.provider}__${req.session_key}` !== rowKey) {
+      continue;
+    }
+    if (best === null || req.created_ms > best.created_ms) {
+      best = req;
+    }
+  }
+  return best;
+}
+
+/**
+ * The request a row offers Allow and Deny for. Waiting and running rows can
+ * have one: a subagent or a parallel tool call can flip a waiting row to
+ * running while its hook still waits.
+ */
+export function rowApproval(row, approvals) {
+  const live = row.status === "waiting_approval" || row.status === "running";
+  return live ? approvalFor(row.key, approvals) : null;
+}
+
+/**
+ * Everything being approved: the request's summary (or tool name), then
+ * every line of its detail. Lines are kept whole; the view scrolls and
+ * wraps them rather than clipping.
+ */
+export function approvalLines(req) {
+  if (!req) {
+    return [];
+  }
+  const all = req.detail ? String(req.detail).split(/\r?\n/) : [];
+  return [approvalTitle(req), ...all];
+}
+
+/**
+ * Which buttons a request offers. A request whose detail was cut cannot be
+ * judged from what is shown, so it is Deny only, with a note.
+ */
+export function approvalChoices(req) {
+  if (req && req.truncated === true) {
+    return { allow: false, deny: true, note: "Too long to show in full. Answer in the terminal." };
+  }
+  return { allow: true, deny: true, note: null };
+}
+
+/** "Allow Bash: rm -rf build" or "Deny Bash: rm -rf build". */
+export function approvalButtonLabel(allow, req) {
+  return `${allow ? "Allow" : "Deny"} ${approvalTitle(req)}`;
+}
+
+function approvalTitle(req) {
+  return String(req.summary || req.tool_name || "");
+}
+
+/**
+ * A click's decision on the row `rowKey`, kept until shortly after its
+ * request leaves read_approvals. `settledMs` is null while `decide` is in
+ * flight; `goneMs` is when its request was first seen gone, or null.
+ */
+export function decisionStarted(allow, nowMs, rowKey = null) {
+  return { allow, rowKey, startedMs: nowMs, settledMs: null, failed: false, goneMs: null };
+}
+
+/** The decision once `decide` resolved. */
+export function decisionSent(decision, nowMs) {
+  return { ...decision, settledMs: nowMs };
+}
+
+/** The decision once `decide` rejected: the request is no longer pending. */
+export function decisionFailed(decision, nowMs) {
+  return { ...decision, settledMs: nowMs, failed: true };
+}
+
+/**
+ * How a request's buttons look: enabled with no decision; once clicked,
+ * disabled with a note. A failed decide never reads as success.
+ */
+export function decisionView(decision) {
+  if (!decision) {
+    return { disabled: false, note: null };
+  }
+  if (decision.failed) {
+    return { disabled: true, note: "No longer pending" };
+  }
+  if (decision.settledMs === null) {
+    return { disabled: true, note: "Sending..." };
+  }
+  return { disabled: true, note: decision.allow ? "Allowed" : "Denied" };
+}
+
+/** How long a decision's note stays after its request leaves the list. */
+export const SETTLED_NOTE_MS = 1500;
+
+/**
+ * The decisions to keep after a poll at `nowMs` that listed `approvals`.
+ * Each one stays, its buttons disabled and its outcome shown, while its
+ * request is listed; once the request is gone its note alone stays for
+ * SETTLED_NOTE_MS (see lingeringNote). A decision is never re-enabled.
+ */
+export function pruneDecisions(decisions, approvals, nowMs) {
+  const listed = new Set((Array.isArray(approvals) ? approvals : []).map((req) => req.id));
+  const kept = new Map();
+  for (const [id, decision] of decisions) {
+    if (listed.has(id)) {
+      kept.set(id, decision);
+      continue;
+    }
+    const goneMs = decision.goneMs ?? nowMs;
+    if (nowMs - goneMs < SETTLED_NOTE_MS) {
+      kept.set(id, decision.goneMs === goneMs ? decision : { ...decision, goneMs });
+    }
+  }
+  return kept;
+}
+
+/**
+ * The note a row shows, without buttons, for its newest decision whose
+ * request has left the list; null when there is none.
+ */
+export function lingeringNote(rowKey, decisions) {
+  let newest = null;
+  for (const decision of decisions.values()) {
+    if (decision.rowKey !== rowKey || decision.goneMs === null) {
+      continue;
+    }
+    if (newest === null || decision.startedMs > newest.startedMs) {
+      newest = decision;
+    }
+  }
+  return newest ? decisionView(newest).note : null;
+}
+
+/**
+ * True when a press at `offsetX` (from the element's padding edge) is on
+ * its vertical scrollbar, right of its `clientWidth`. Such a press scrolls
+ * and must not start a window drag.
+ */
+export function onScrollbar(offsetX, clientWidth) {
+  return offsetX >= clientWidth;
 }
 
 function capitalize(id) {
   const text = String(id);
   return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+/** A decide click is ignored for this long after the layout last moved. */
+export const CLICK_GUARD_MS = 500;
+
+/**
+ * Tracks when each shown request first appeared and when the approvals set
+ * or row order last changed, so a click aimed at one button cannot land on a
+ * different Allow that slid under the pointer. `previous` is the last
+ * tracker (or null); `shownIds` are the request ids on screen and `rowKeys`
+ * the rows in order. Returns a new tracker; the input is not mutated.
+ */
+export function trackLayout(previous, shownIds, rowKeys, nowMs) {
+  const signature = JSON.stringify([[...shownIds].sort(), rowKeys]);
+  const firstSeen = new Map();
+  for (const id of shownIds) {
+    firstSeen.set(id, previous && previous.firstSeen.has(id) ? previous.firstSeen.get(id) : nowMs);
+  }
+  const changedMs = previous && previous.signature === signature ? previous.changedMs : nowMs;
+  return { firstSeen, signature, changedMs };
+}
+
+/**
+ * Whether a click on a decide button for request `id` is accepted: not if
+ * that request first rendered, or the layout last changed, less than
+ * CLICK_GUARD_MS ago, and not if it is not shown at all.
+ */
+export function decideAccepted(tracker, id, nowMs) {
+  if (!tracker || !tracker.firstSeen.has(id)) {
+    return false;
+  }
+  return (
+    nowMs - tracker.firstSeen.get(id) >= CLICK_GUARD_MS && nowMs - tracker.changedMs >= CLICK_GUARD_MS
+  );
 }

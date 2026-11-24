@@ -172,12 +172,16 @@ fn resume_unless_waiting(s: &mut SessionState, same_tool: bool, now_ms: i64) {
 
 /// `"<tool>: <command or file_path>"`, cleaned, as stored in `pending`.
 fn pending_text(input: &HookInput) -> String {
+    clean(&pending_raw(input), TEXT_MAX)
+}
+
+/// `"<tool>: <command or file_path>"`, uncleaned.
+pub(crate) fn pending_raw(input: &HookInput) -> String {
     let name = input.tool_name.as_deref().unwrap_or("Tool");
-    let pending = match input.command.as_ref().or(input.file_path.as_ref()) {
+    match input.command.as_ref().or(input.file_path.as_ref()) {
         Some(detail) => format!("{name}: {detail}"),
         None => name.to_owned(),
-    };
-    clean(&pending, TEXT_MAX)
+    }
 }
 
 /// The session's file key: `session_id` sanitized to `[A-Za-z0-9_-]`

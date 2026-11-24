@@ -3,12 +3,25 @@
 import {
   HOLD_MAX_MS,
   ageText,
+  approvalButtonLabel,
+  approvalChoices,
+  approvalLines,
+  decideAccepted,
+  trackLayout,
   cardCatchUp,
   catchUpLines,
   collisionText,
+  decisionFailed,
+  decisionSent,
+  decisionStarted,
+  decisionView,
   installedNote,
   isHeld,
+  lingeringNote,
+  onScrollbar,
   pressHold,
+  pruneDecisions,
+  rowApproval,
   setupView,
   statusMeta
 } from "./view.js";
@@ -20,6 +33,8 @@ const invoke = (command, args) => window.__TAURI__.core.invoke(command, args);
 const pin = document.querySelector("#pin");
 const agents = document.querySelector("#agents");
 const setup = document.querySelector("#setup");
+const setupNoteBox = document.querySelector("#setup-note");
+const approvalsToggle = document.querySelector("#approvals-toggle");
 const setupTitle = document.querySelector("#setup-title");
 const setupDetail = document.querySelector("#setup-detail");
 const setupWayland = document.querySelector("#setup-wayland");
@@ -28,6 +43,13 @@ const setupButton = document.querySelector("#setup-button");
 let expanded = true;
 let rows = [];
 let rowsError = null;
+// Pending approval requests from the last poll (see read_approvals).
+let approvals = [];
+// When each shown request first appeared and the layout last moved; see
+// decideAccepted.
+let layout = null;
+// Clicked Allow/Deny decisions by request id (see view.js decisionStarted).
+let decisions = new Map();
 let renderedSignature = "";
 // Open cards, keyed by row key, mapped to the row's catch_up as it was just
 // before mark_seen emptied the backend's since-seen lists.
@@ -50,7 +72,10 @@ pin.addEventListener("pointerdown", (event) => {
   if (event.button !== 0) {
     return;
   }
-  holdSince = pressHold(isInteractive(event.target), Date.now());
+  // A press on a scrollbar (the pin's, once the window is capped, or a
+  // detail box's) scrolls: it holds rebuilds and never starts a drag.
+  const interactive = isInteractive(event.target) || onScrollbarOf(event);
+  holdSince = pressHold(interactive, Date.now());
   if (holdSince !== null) {
     clearTimeout(holdTimer);
     holdTimer = setTimeout(releaseHold, HOLD_MAX_MS);
@@ -63,8 +88,13 @@ pin.addEventListener("pointerdown", (event) => {
   invoke("start_window_drag").catch((error) => console.warn("Unable to start window drag", error));
 });
 
+function onScrollbarOf(event) {
+  const target = event.target;
+  return target.scrollHeight > target.clientHeight && onScrollbar(event.offsetX, target.clientWidth);
+}
+
 pin.addEventListener("dblclick", (event) => {
-  if (isInteractive(event.target)) {
+  if (isInteractive(event.target) || onScrollbarOf(event)) {
     return;
   }
   expanded = !expanded;
@@ -73,6 +103,11 @@ pin.addEventListener("dblclick", (event) => {
 });
 
 agents.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-decide]");
+  if (button) {
+    decideFrom(button);
+    return;
+  }
   const row = event.target.closest(".agent[data-key]");
   if (!expanded || !row) {
     return;
@@ -90,6 +125,41 @@ agents.addEventListener("click", (event) => {
   renderRows(true);
 });
 
+// Sends one decision. Both buttons stay disabled, with the outcome shown,
+// until the request leaves read_approvals; a rejected decide shows "No
+// longer pending". The backend never replaces a decision either.
+function decideFrom(button) {
+  const id = button.dataset.id;
+  if (!id || decisions.has(id)) {
+    return;
+  }
+  // A click right after the layout moved may have been aimed at another
+  // button: ignore it and leave the buttons enabled.
+  if (!decideAccepted(layout, id, Date.now())) {
+    return;
+  }
+  const allow = button.dataset.decide === "allow";
+  for (const sibling of button.parentElement.querySelectorAll("button")) {
+    sibling.disabled = true;
+  }
+  decisions.set(id, decisionStarted(allow, Date.now(), button.dataset.rowKey));
+  renderRows(true);
+  invoke("decide", { id, allow })
+    .then(() => settle(id, decisionSent))
+    .catch((error) => {
+      console.warn("Unable to decide", error);
+      settle(id, decisionFailed);
+    });
+}
+
+function settle(id, next) {
+  const decision = decisions.get(id);
+  if (decision) {
+    decisions.set(id, next(decision, Date.now()));
+    renderRows(true);
+  }
+}
+
 for (const type of ["pointerup", "pointercancel", "blur"]) {
   window.addEventListener(type, releaseHold);
 }
@@ -102,6 +172,20 @@ function releaseHold() {
     setTimeout(() => renderRows(true), 0);
   }
 }
+
+approvalsToggle.addEventListener("change", async () => {
+  const on = approvalsToggle.checked;
+  approvalsToggle.disabled = true;
+  try {
+    await invoke("set_approvals_enabled", { on });
+  } catch (error) {
+    setupNote = { title: "Approvals switch failed", text: String(error) };
+    renderSetup();
+  } finally {
+    await refreshApprovalsEnabled();
+    approvalsToggle.disabled = false;
+  }
+});
 
 setupButton.addEventListener("click", async () => {
   installing = true;
@@ -117,18 +201,25 @@ setupButton.addEventListener("click", async () => {
   }
 });
 
-new ResizeObserver(fitWindow).observe(pin);
-
-// Buttons always take clicks; rows and cards only while expanded, since the
-// collapsed pin shows bare dots and is dragged or double-clicked anywhere.
-function isInteractive(target) {
-  return Boolean(target.closest("button") || (expanded && target.closest(".session")));
+// Once the window is capped the pin stops growing, so watch its parts too.
+const resizes = new ResizeObserver(fitWindow);
+for (const node of [pin, agents, setup]) {
+  resizes.observe(node);
 }
 
+// Buttons and the approvals switch always take clicks; rows and cards only
+// while expanded, since the collapsed pin shows bare dots and is dragged or
+// double-clicked anywhere.
+function isInteractive(target) {
+  return Boolean(target.closest("button, input, label") || (expanded && target.closest(".session")));
+}
+
+// Asks for the pin's full content height; fit_window caps it at the work
+// area, and the pin (max-height: 100vh) scrolls the rest.
 function fitWindow() {
   const rect = pin.getBoundingClientRect();
   const width = Math.ceil(rect.width);
-  const height = Math.ceil(rect.height);
+  const height = Math.ceil(pin.scrollHeight + (pin.offsetHeight - pin.clientHeight));
   const size = `${width}x${height}`;
   if (width <= 0 || height <= 0 || size === fittedSize) {
     return;
@@ -141,13 +232,24 @@ function fitWindow() {
 }
 
 async function refresh() {
-  try {
-    rows = await invoke("read_rows");
+  const [rowsResult, approvalsResult] = await Promise.allSettled([
+    invoke("read_rows"),
+    invoke("read_approvals")
+  ]);
+  if (rowsResult.status === "fulfilled") {
+    rows = rowsResult.value;
     rowsError = null;
-  } catch (error) {
+  } else {
     rows = [];
-    rowsError = String(error);
+    rowsError = String(rowsResult.reason);
   }
+  if (approvalsResult.status === "fulfilled") {
+    approvals = approvalsResult.value;
+  } else {
+    approvals = [];
+    console.warn("Unable to read approvals", approvalsResult.reason);
+  }
+  decisions = pruneDecisions(decisions, approvals, Date.now());
   renderRows(false);
 }
 
@@ -165,12 +267,21 @@ function renderRows(force) {
     }
   }
 
+  layout = trackLayout(
+    layout,
+    rows.map((row) => rowApproval(row, approvals)).filter(Boolean).map((request) => request.id),
+    rows.map((row) => row.key),
+    now
+  );
+
   // Rebuild only when something visible changed.
   const signature = JSON.stringify([
     rows,
     rows.map((row) => ageText(row.updated_ms, now)),
     [...openCards.keys()],
-    rowsError
+    rowsError,
+    approvals,
+    [...decisions]
   ]);
   if (!force && signature === renderedSignature) {
     return;
@@ -185,7 +296,27 @@ function renderRows(force) {
     agents.replaceChildren(placeholder("idle", "No active sessions", ""));
     return;
   }
+  // A rebuild replaces the buttons and detail boxes, so keep keyboard focus
+  // on the same button and each detail box's scroll position.
+  const focused = document.activeElement && document.activeElement.dataset
+    ? document.activeElement.dataset.focusId
+    : undefined;
+  const scrolls = new Map(
+    [...agents.querySelectorAll("[data-scroll-id]")].map((node) => [node.dataset.scrollId, node.scrollTop])
+  );
   agents.replaceChildren(...rows.map((row) => session(row, now)));
+  for (const node of agents.querySelectorAll("[data-scroll-id]")) {
+    const top = scrolls.get(node.dataset.scrollId);
+    if (top) {
+      node.scrollTop = top;
+    }
+  }
+  if (focused) {
+    const again = [...agents.querySelectorAll("[data-focus-id]")].find((node) => node.dataset.focusId === focused);
+    if (again && !again.disabled) {
+      again.focus();
+    }
+  }
 }
 
 function session(row, now) {
@@ -211,10 +342,74 @@ function session(row, now) {
     node.appendChild(line);
   }
 
+  const request = rowApproval(row, approvals);
+  const settled = request ? null : lingeringNote(row.key, decisions);
+  if (request) {
+    node.appendChild(approvalStrip(request, row.key));
+  } else if (settled) {
+    // The request is gone: its outcome alone, briefly, with no buttons.
+    const strip = el("div", "approval approval--settled");
+    strip.setAttribute("data-expanded-only", "");
+    strip.appendChild(approvalNote(settled));
+    node.appendChild(strip);
+  }
+
   if (open) {
     node.appendChild(card(cardCatchUp(row.catch_up, openCards.get(row.key))));
   }
   return node;
+}
+
+// Everything being approved, with Allow and Deny right under the summary so
+// they stay on screen; the detail follows in a scroll box, wrapped, never
+// clipped. Not inside .agent[data-key], so a click never toggles the card.
+function approvalStrip(request, rowKey) {
+  const view = decisionView(decisions.get(request.id));
+  const node = el("div", "approval");
+  node.setAttribute("data-expanded-only", "");
+  const [summary, ...detail] = approvalLines(request);
+  node.appendChild(el("div", "approval__summary", summary));
+  const actions = el("div", "approval__actions");
+  const choices = approvalChoices(request);
+  for (const allow of [true, false]) {
+    if (allow && !choices.allow) {
+      continue;
+    }
+    const button = el(
+      "button",
+      `approval__button ${allow ? "approval__button--allow" : "approval__button--deny"}`,
+      allow ? "Allow" : "Deny"
+    );
+    button.type = "button";
+    button.dataset.decide = allow ? "allow" : "deny";
+    button.dataset.id = request.id;
+    button.dataset.rowKey = rowKey;
+    button.dataset.focusId = `${request.id}:${button.dataset.decide}`;
+    button.setAttribute("aria-label", approvalButtonLabel(allow, request));
+    button.disabled = view.disabled;
+    actions.appendChild(button);
+  }
+  node.appendChild(actions);
+  if (view.note) {
+    node.appendChild(approvalNote(view.note));
+  } else if (choices.note) {
+    node.appendChild(approvalNote(choices.note));
+  }
+  if (detail.length) {
+    const block = el("div", "approval__detail");
+    block.dataset.scrollId = request.id;
+    for (const line of detail) {
+      block.appendChild(el("div", "approval__detail-line", line));
+    }
+    node.appendChild(block);
+  }
+  return node;
+}
+
+function approvalNote(text) {
+  const note = el("div", "approval__note", text);
+  note.setAttribute("role", "status");
+  return note;
 }
 
 function card(catchUp) {
@@ -262,11 +457,13 @@ function el(tag, className, text) {
   return node;
 }
 
+// The setup section always holds the approvals switch; its note shows only
+// when there is something to say.
 function renderSetup() {
   const view = setupView(integrations, setupNote);
-  const visible = expanded && view.visible;
-  setup.hidden = !visible;
-  if (!visible) {
+  setup.hidden = !expanded;
+  setupNoteBox.hidden = !view.visible;
+  if (!expanded || !view.visible) {
     return;
   }
 
@@ -276,7 +473,15 @@ function renderSetup() {
   setupWayland.hidden = !view.wayland;
   setupButton.hidden = !view.button;
   setupButton.disabled = installing;
-  setupButton.textContent = installing ? "..." : "Set up";
+  setupButton.textContent = installing ? "..." : view.buttonLabel;
+}
+
+async function refreshApprovalsEnabled() {
+  try {
+    approvalsToggle.checked = Boolean(await invoke("approvals_enabled"));
+  } catch (error) {
+    console.warn("Unable to read the approvals switch", error);
+  }
 }
 
 async function refreshIntegrations() {
@@ -291,4 +496,5 @@ async function refreshIntegrations() {
 
 refresh();
 refreshIntegrations();
+refreshApprovalsEnabled();
 setInterval(refresh, POLL_MS);
