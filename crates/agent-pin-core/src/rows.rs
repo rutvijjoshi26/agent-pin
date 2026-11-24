@@ -29,6 +29,7 @@ pub struct CatchUp {
 #[derive(Serialize, Clone, PartialEq, Eq, Debug)]
 pub struct Collision {
     pub path: String,
+    pub other_key: String,
     pub other_label: String,
 }
 
@@ -47,24 +48,28 @@ pub struct Row {
 
 /// Builds the visible rows, sorted for display.
 pub fn build_rows(sessions: &[SessionState], now_ms: i64) -> Vec<Row> {
-    let mut rows: Vec<Row> = sessions
+    let shown: Vec<&SessionState> = sessions.iter().filter(|s| visible(s, now_ms)).collect();
+    let keys: Vec<String> = shown.iter().map(|s| row_key(s)).collect();
+    let labels = labels(&shown);
+    let mut rows: Vec<Row> = shown
         .iter()
-        .filter(|s| visible(s, now_ms))
-        .map(|s| Row {
-            key: row_key(s),
-            label: label(s),
+        .enumerate()
+        .map(|(i, s)| Row {
+            key: keys[i].clone(),
+            label: labels[i].clone(),
             project: project(s.cwd.as_deref()),
             status: s.status,
             quiet: s.status == Status::Running && now_ms - s.updated_ms > RUNNING_QUIET_MS,
             updated_ms: s.updated_ms,
             catch_up: catch_up(s),
-            collisions: collisions(s, sessions, now_ms),
+            collisions: collisions(i, &shown, &keys, &labels, now_ms),
         })
         .collect();
     rows.sort_by(|a, b| {
         rank(a.status)
             .cmp(&rank(b.status))
             .then(b.updated_ms.cmp(&a.updated_ms))
+            .then_with(|| a.key.cmp(&b.key))
     });
     rows
 }
@@ -98,12 +103,30 @@ fn row_key(s: &SessionState) -> String {
 }
 
 /// `"Claude · web-app"`, or just `"Claude"` without a project.
-fn label(s: &SessionState) -> String {
+fn base_label(s: &SessionState) -> String {
     let name = display_name(&s.provider);
     match project(s.cwd.as_deref()) {
         Some(project) => format!("{name} · {project}"),
         None => name,
     }
+}
+
+/// Labels for the shown rows. When several rows share a base label, each
+/// of them gets `" #<first 4 chars of session_key>"` appended.
+fn labels(shown: &[&SessionState]) -> Vec<String> {
+    let base: Vec<String> = shown.iter().map(|s| base_label(s)).collect();
+    shown
+        .iter()
+        .zip(&base)
+        .map(|(s, label)| {
+            if base.iter().filter(|b| *b == label).count() > 1 {
+                let short: String = s.session_key.chars().take(4).collect();
+                format!("{label} #{short}")
+            } else {
+                label.clone()
+            }
+        })
+        .collect()
 }
 
 /// The cwd's last component, splitting on both `/` and `\`.
@@ -135,26 +158,38 @@ fn catch_up(s: &SessionState) -> CatchUp {
     }
 }
 
-/// Paths `s` touched within the window that another session also touched
-/// within the window. Paths are compared as plain strings.
-fn collisions(s: &SessionState, all: &[SessionState], now_ms: i64) -> Vec<Collision> {
+/// Paths shown row `i` touched within the window that another shown row
+/// also touched within the window, one entry per (path, other row).
+/// Paths are compared as plain strings.
+fn collisions(
+    i: usize,
+    shown: &[&SessionState],
+    keys: &[String],
+    labels: &[String],
+    now_ms: i64,
+) -> Vec<Collision> {
     let recent = |s: &SessionState, path: &str| {
         s.files
             .iter()
             .any(|f| f.path == path && now_ms - f.at_ms < COLLISION_WINDOW_MS)
     };
-    let me = row_key(s);
+    let me = shown[i];
     let mut out: Vec<Collision> = Vec::new();
-    for f in &s.files {
-        if !recent(s, &f.path) {
+    for f in &me.files {
+        if !recent(me, &f.path) {
             continue;
         }
-        for other in all.iter().filter(|o| row_key(o) != me) {
-            if recent(other, &f.path) {
-                let c = Collision { path: f.path.clone(), other_label: label(other) };
-                if !out.contains(&c) {
-                    out.push(c);
-                }
+        for (j, other) in shown.iter().enumerate() {
+            if keys[j] == keys[i] || !recent(other, &f.path) {
+                continue;
+            }
+            let dup = out.iter().any(|c| c.path == f.path && c.other_key == keys[j]);
+            if !dup {
+                out.push(Collision {
+                    path: f.path.clone(),
+                    other_key: keys[j].clone(),
+                    other_label: labels[j].clone(),
+                });
             }
         }
     }
@@ -301,11 +336,19 @@ mod tests {
         let rows = build_rows(&[a, b], NOW);
         assert_eq!(
             rows[0].collisions,
-            [Collision { path: "/r/a.rs".to_owned(), other_label: "Codex · sub".to_owned() }]
+            [Collision {
+                path: "/r/a.rs".to_owned(),
+                other_key: "codex__b".to_owned(),
+                other_label: "Codex · sub".to_owned()
+            }]
         );
         assert_eq!(
             rows[1].collisions,
-            [Collision { path: "/r/a.rs".to_owned(), other_label: "Claude · r".to_owned() }]
+            [Collision {
+                path: "/r/a.rs".to_owned(),
+                other_key: "claude__a".to_owned(),
+                other_label: "Claude · r".to_owned()
+            }]
         );
     }
 
@@ -338,5 +381,77 @@ mod tests {
         assert_eq!(row.label, "Claude");
         assert_eq!(row.project, None);
         assert_eq!(project(Some("/home/me/repo/")), Some("repo".to_owned()));
+    }
+
+    #[test]
+    fn same_project_collision_labels_are_distinct() {
+        let mut a = session("aaaa1111", Status::Running, NOW);
+        a.files = vec![touch("/r/x.rs", NOW - MIN)];
+        let mut b = session("bbbb2222", Status::Running, NOW - 1);
+        b.files = vec![touch("/r/x.rs", NOW - 2 * MIN)];
+        let rows = build_rows(&[a, b], NOW);
+        assert_eq!(rows[0].label, "Claude · r #aaaa");
+        assert_eq!(rows[1].label, "Claude · r #bbbb");
+        for (me, other) in [(0, 1), (1, 0)] {
+            let c = &rows[me].collisions;
+            assert_eq!(c.len(), 1);
+            assert_eq!(c[0].other_key, rows[other].key);
+            assert_eq!(c[0].other_label, rows[other].label);
+            assert_ne!(c[0].other_label, rows[me].label);
+        }
+    }
+
+    #[test]
+    fn unique_label_gets_no_suffix() {
+        let a = session("aaaa1111", Status::Running, NOW);
+        let mut b = session("bbbb2222", Status::Running, NOW);
+        b.cwd = Some("/other".to_owned());
+        let rows = build_rows(&[a, b], NOW);
+        assert_eq!(rows[0].label, "Claude · r");
+        assert_eq!(rows[1].label, "Claude · other");
+    }
+
+    #[test]
+    fn dedup_by_other_key_keeps_same_label_others() {
+        let mut a = session("a", Status::Running, NOW);
+        a.provider = "codex".to_owned();
+        a.files = vec![touch("/r/x.rs", NOW - MIN), touch("/r/x.rs", NOW - 2 * MIN)];
+        let mut b = session("same1", Status::Running, NOW);
+        b.files = vec![touch("/r/x.rs", NOW - MIN), touch("/r/x.rs", NOW - 3 * MIN)];
+        let mut c = session("same2", Status::Running, NOW);
+        c.files = vec![touch("/r/x.rs", NOW - MIN)];
+        let rows = build_rows(&[a, b, c], NOW);
+        let a_row = rows.iter().find(|r| r.key == "codex__a").unwrap();
+        let others: Vec<(&str, &str)> = a_row
+            .collisions
+            .iter()
+            .map(|c| (c.other_key.as_str(), c.other_label.as_str()))
+            .collect();
+        assert_eq!(
+            others,
+            [("claude__same1", "Claude · r #same"), ("claude__same2", "Claude · r #same")]
+        );
+    }
+
+    #[test]
+    fn hidden_session_is_not_a_collision_partner() {
+        let mut a = session("a", Status::Running, NOW);
+        a.files = vec![touch("/r/x.rs", NOW - MIN)];
+        let mut idle = session("idle", Status::Idle, NOW - 3 * MIN);
+        idle.files = vec![touch("/r/x.rs", NOW - 4 * MIN)];
+        let rows = build_rows(&[a, idle], NOW);
+        assert_eq!(keys(&rows), ["claude__a"]);
+        assert!(rows[0].collisions.is_empty());
+    }
+
+    #[test]
+    fn ties_broken_by_key_ascending() {
+        let sessions = [
+            session("c", Status::Running, NOW),
+            session("a", Status::Running, NOW),
+            session("b", Status::Running, NOW),
+        ];
+        let rows = build_rows(&sessions, NOW);
+        assert_eq!(keys(&rows), ["claude__a", "claude__b", "claude__c"]);
     }
 }
