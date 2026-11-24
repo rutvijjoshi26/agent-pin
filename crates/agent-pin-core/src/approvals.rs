@@ -277,7 +277,7 @@ pub fn post(dir: &Path, r: &Request) -> io::Result<Posted> {
     Ok(Posted { request: r.clone() })
 }
 
-/// Every valid, unexpired request, oldest first. Also sweeps
+/// Every valid, unexpired, undecided request, oldest first. Also sweeps
 /// `<dir>/approvals`, best effort:
 /// - expired requests (`deadline_ms` passed), and requests whose file mtime
 ///   is more than [`HOOK_STALE_MS`] old (their hook is gone, e.g. killed
@@ -311,8 +311,13 @@ pub fn list_pending(dir: &Path, now_ms: i64) -> Vec<Request> {
                 Ok(r) if r.id == stem && check_stem(stem).is_ok() => {
                     let hook_gone =
                         older_than(&path, Duration::from_millis(HOOK_STALE_MS as u64));
+                    let decided = approvals.join(format!("{stem}.dec.json")).exists();
                     if now_ms < r.deadline_ms && !hook_gone {
-                        out.push(r);
+                        // A decided request waits only for its hook to read
+                        // the decision; it is not offered again.
+                        if !decided {
+                            out.push(r);
+                        }
                     } else {
                         remove_files(dir, stem);
                     }
@@ -387,9 +392,11 @@ fn sweep_alive_temps(dir: &Path) {
     }
 }
 
-/// Atomically writes the decision for request `id`. Errors with
-/// `InvalidInput` for an id outside `[A-Za-z0-9_-]` and `NotFound` when no
-/// such request is pending.
+/// Writes the decision for request `id`, once: an existing decision is
+/// never replaced, so a click can't be changed before the hook reads it.
+/// Errors with `InvalidInput` for an id outside `[A-Za-z0-9_-]`, `NotFound`
+/// when no such request is pending and `AlreadyExists` when it is already
+/// decided.
 pub fn decide(dir: &Path, id: &str, b: Behavior) -> io::Result<()> {
     check_stem(id)?;
     if !req_path(dir, id).is_file() {
@@ -398,10 +405,17 @@ pub fn decide(dir: &Path, id: &str, b: Behavior) -> io::Result<()> {
             format!("no pending approval request {id:?}"),
         ));
     }
-    let approvals = approvals_dir(dir);
     let body = serde_json::to_vec(&Decision { behavior: b }).map_err(io::Error::other)?;
-    let name = format!("{id}.dec.json");
-    write_bytes_atomic(&approvals, &name, &approvals.join(&name), &body)
+    publish_new(&approvals_dir(dir), &format!("{id}.dec.json"), &body).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("approval request {id:?} is already decided"),
+            )
+        } else {
+            error
+        }
+    })
 }
 
 /// Best-effort removal of a request's request and decision files.
@@ -734,6 +748,37 @@ mod tests {
     }
 
     #[test]
+    fn decide_is_create_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let r = new_request("claude", "s1", &bash("ls"), T0);
+        post(dir, &r).unwrap();
+        decide(dir, &r.id, Behavior::Allow).unwrap();
+        let first = fs::read(dec_path(dir, &r.id)).unwrap();
+        let err = decide(dir, &r.id, Behavior::Deny).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(dec_path(dir, &r.id)).unwrap(), first);
+        let err = decide(dir, &r.id, Behavior::Allow).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(dec_path(dir, &r.id)).unwrap(), first);
+    }
+
+    #[test]
+    fn list_pending_skips_decided_requests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let open = new_request("claude", "s1", &bash("ls"), T0);
+        let decided = new_request("claude", "s2", &bash("ls"), T0);
+        post(dir, &open).unwrap();
+        post(dir, &decided).unwrap();
+        decide(dir, &decided.id, Behavior::Deny).unwrap();
+        assert_eq!(list_pending(dir, T0), vec![open.clone()]);
+        // Skipped, not swept: the hook still has to read its decision.
+        assert!(req_path(dir, &decided.id).exists());
+        assert!(dec_path(dir, &decided.id).exists());
+    }
+
+    #[test]
     fn decision_json_exact() {
         assert_eq!(
             decision_json(Behavior::Allow),
@@ -888,7 +933,9 @@ mod tests {
         }
         set_age(&tmp_old, Duration::from_secs(61));
         set_age(&alive_tmp_old, Duration::from_secs(61));
-        assert_eq!(list_pending(dir, T0), vec![live.clone()]);
+        // Decided, so not listed; its files stay for the hook to read.
+        assert!(list_pending(dir, T0).is_empty());
+        assert!(req_path(dir, &live.id).exists());
         assert!(!orphan_old.exists(), "old orphan decision removed");
         assert!(orphan_new.exists(), "recent orphan decision kept");
         assert!(dec_path(dir, &live.id).exists(), "a live request's decision is kept");

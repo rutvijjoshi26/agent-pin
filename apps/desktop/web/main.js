@@ -109,8 +109,9 @@ agents.addEventListener("click", (event) => {
   renderRows(true);
 });
 
-// Sends one decision. Both buttons stay disabled until the poll after
-// decide settles; a rejected decide shows "No longer pending" instead.
+// Sends one decision. Both buttons stay disabled, with the outcome shown,
+// until the request leaves read_approvals; a rejected decide shows "No
+// longer pending". The backend never replaces a decision either.
 function decideFrom(button) {
   const id = button.dataset.id;
   if (!id || decisions.has(id)) {
@@ -204,7 +205,6 @@ function fitWindow() {
 }
 
 async function refresh() {
-  const pollStartedMs = Date.now();
   const [rowsResult, approvalsResult] = await Promise.allSettled([
     invoke("read_rows"),
     invoke("read_approvals")
@@ -222,7 +222,7 @@ async function refresh() {
     approvals = [];
     console.warn("Unable to read approvals", approvalsResult.reason);
   }
-  decisions = pruneDecisions(decisions, approvals, pollStartedMs);
+  decisions = pruneDecisions(decisions, approvals);
   renderRows(false);
 }
 
@@ -304,20 +304,27 @@ function session(row, now) {
   }
 
   if (open) {
-    node.appendChild(card(cardCatchUp(row.catch_up, openCards.get(row.key)), request));
+    node.appendChild(card(cardCatchUp(row.catch_up, openCards.get(row.key))));
   }
   return node;
 }
 
-// The request's summary with Allow and Deny. Not inside .agent[data-key],
-// so a click on it never toggles the card.
+// Everything being approved (summary, then detail, wrapped, never clipped)
+// with Allow and Deny. Not inside .agent[data-key], so a click on it never
+// toggles the card.
 function approvalStrip(request) {
   const view = decisionView(decisions.get(request.id));
   const node = el("div", "approval");
   node.setAttribute("data-expanded-only", "");
-  const summary = el("div", "approval__summary", approvalLines(request)[0]);
-  summary.title = approvalLines(request)[0];
-  node.appendChild(summary);
+  const [summary, ...detail] = approvalLines(request);
+  node.appendChild(el("div", "approval__summary", summary));
+  if (detail.length) {
+    const block = el("div", "approval__detail");
+    for (const line of detail) {
+      block.appendChild(el("div", "approval__detail-line", line));
+    }
+    node.appendChild(block);
+  }
   const actions = el("div", "approval__actions");
   for (const allow of [true, false]) {
     const button = el(
@@ -342,23 +349,15 @@ function approvalStrip(request) {
   return node;
 }
 
-function card(catchUp, request) {
+function card(catchUp) {
   const node = el("div", "card");
   node.setAttribute("data-expanded-only", "");
   const lines = catchUpLines(catchUp);
-  const detail = approvalLines(request).slice(1);
-  if (!lines.length && !detail.length) {
+  if (!lines.length) {
     node.appendChild(el("div", "card__line card__line--empty", "Nothing new since you looked"));
   }
   for (const line of lines) {
     node.appendChild(el("div", "card__line", line));
-  }
-  if (detail.length) {
-    const block = el("div", "card__detail");
-    for (const line of detail) {
-      block.appendChild(el("div", "card__detail-line", line));
-    }
-    node.appendChild(block);
   }
   return node;
 }

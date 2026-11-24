@@ -177,7 +177,7 @@ export function setupView(integrations, note) {
   };
 }
 
-const MAX_DETAIL_LINES = 6;
+const MAX_DETAIL_LINES = 8;
 
 /**
  * The pending approval request for a row (key `provider__session_key`), or
@@ -196,18 +196,32 @@ export function approvalFor(rowKey, approvals) {
   return best;
 }
 
-/** The request a row offers Allow and Deny for: only waiting rows have one. */
+/**
+ * The request a row offers Allow and Deny for. Waiting and running rows can
+ * have one: a subagent or a parallel tool call can flip a waiting row to
+ * running while its hook still waits.
+ */
 export function rowApproval(row, approvals) {
-  return row.status === "waiting_approval" ? approvalFor(row.key, approvals) : null;
+  const live = row.status === "waiting_approval" || row.status === "running";
+  return live ? approvalFor(row.key, approvals) : null;
 }
 
-/** The request's summary (or tool name), then the first 6 lines of its detail. */
+/**
+ * Everything being approved: the request's summary (or tool name), then up
+ * to 8 lines of its detail, then "… N more lines" for the rest. Lines are
+ * kept whole; the view wraps them rather than clipping.
+ */
 export function approvalLines(req) {
   if (!req) {
     return [];
   }
-  const detail = req.detail ? String(req.detail).split(/\r?\n/).slice(0, MAX_DETAIL_LINES) : [];
-  return [approvalTitle(req), ...detail];
+  const all = req.detail ? String(req.detail).split(/\r?\n/) : [];
+  const lines = [approvalTitle(req), ...all.slice(0, MAX_DETAIL_LINES)];
+  const more = all.length - MAX_DETAIL_LINES;
+  if (more > 0) {
+    lines.push(`… ${more} more ${more === 1 ? "line" : "lines"}`);
+  }
+  return lines;
 }
 
 /** "Allow Bash: rm -rf build" or "Deny Bash: rm -rf build". */
@@ -255,21 +269,15 @@ export function decisionView(decision) {
 }
 
 /**
- * The decisions to keep after a poll that started at `pollStartedMs` and
- * listed `approvals`. A decision goes once its request is no longer listed;
- * a sent one also goes at the first poll that started after `decide`
- * settled, so its buttons stay disabled until then. A failed one stays
- * while its request is listed, so nothing is re-enabled.
+ * The decisions to keep after a poll that listed `approvals`: each one
+ * stays, its buttons disabled and its outcome shown, until its request is
+ * no longer listed. A decision is never re-enabled or changed.
  */
-export function pruneDecisions(decisions, approvals, pollStartedMs) {
+export function pruneDecisions(decisions, approvals) {
   const listed = new Set((Array.isArray(approvals) ? approvals : []).map((req) => req.id));
   const kept = new Map();
   for (const [id, decision] of decisions) {
-    if (!listed.has(id)) {
-      continue;
-    }
-    const done = !decision.failed && decision.settledMs !== null && pollStartedMs > decision.settledMs;
-    if (!done) {
+    if (listed.has(id)) {
       kept.set(id, decision);
     }
   }
