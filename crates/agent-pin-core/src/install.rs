@@ -133,20 +133,25 @@ pub fn merge(config: &mut Value, provider: &Provider, exe: &Path) {
 /// Reads and parses a provider config. A missing or blank file is `{}`.
 /// Anything that is not a JSON object is an error.
 fn read_config(path: &Path) -> Result<Option<Value>, String> {
+    Ok(read_config_text(path)?.map(|(_, value)| value))
+}
+
+/// Like [`read_config`], also returning the file's original text.
+fn read_config_text(path: &Path) -> Result<Option<(String, Value)>, String> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(format!("{}: {err}", path.display())),
     };
     if text.trim().is_empty() {
-        return Ok(Some(Value::Object(Default::default())));
+        return Ok(Some((text, Value::Object(Default::default()))));
     }
     let value: Value =
         serde_json::from_str(&text).map_err(|err| format!("{}: {err}", path.display()))?;
     if !value.is_object() {
         return Err(format!("{}: top level is not a JSON object", path.display()));
     }
-    Ok(Some(value))
+    Ok(Some((text, value)))
 }
 
 /// Installs agent-pin hooks for every provider whose config directory exists
@@ -155,7 +160,8 @@ fn read_config(path: &Path) -> Result<Option<Value>, String> {
 /// All configs are read, parsed and merged before anything is written, so an
 /// unparseable file aborts the whole install with no file touched. Each
 /// existing file is backed up to `<file>.agent-pin-backup-<now_secs>` and then
-/// replaced atomically.
+/// replaced atomically. A file whose merged text equals its current text is
+/// left alone: no backup and no write.
 pub fn install(home: &Path, exe: &Path, now_secs: i64) -> Result<Vec<String>, String> {
     let mut planned = Vec::new();
     for provider in PROVIDERS {
@@ -163,17 +169,22 @@ pub fn install(home: &Path, exe: &Path, now_secs: i64) -> Result<Vec<String>, St
         if !provider_dir_exists(home, provider) {
             continue;
         }
-        let existing = read_config(&path)?;
-        let existed = existing.is_some();
-        let mut config = existing.unwrap_or_else(|| Value::Object(Default::default()));
+        let (original, mut config) = match read_config_text(&path)? {
+            Some((text, value)) => (Some(text), value),
+            None => (None, Value::Object(Default::default())),
+        };
         merge(&mut config, provider, exe);
         let text = serde_json::to_string_pretty(&config).map_err(|err| err.to_string())? + "\n";
-        planned.push((provider, path, existed, text));
+        planned.push((provider, path, original, text));
     }
 
     let mut ids = Vec::new();
-    for (provider, path, existed, text) in planned {
-        if existed {
+    for (provider, path, original, text) in planned {
+        if original.as_deref() == Some(text.as_str()) {
+            ids.push(provider.id.to_string());
+            continue;
+        }
+        if original.is_some() {
             backup(&path, now_secs).map_err(|err| format!("backup {}: {err}", path.display()))?;
         }
         write_atomic(&path, text.as_bytes())
@@ -506,6 +517,27 @@ mod tests {
         // A second install in the same second keeps the first backup intact.
         install(home.path(), &exe(), 1_700_000_000).unwrap();
         assert_eq!(fs::read_to_string(&backup).unwrap(), SHARED_GROUP);
+    }
+
+    #[test]
+    fn reinstall_unchanged_writes_no_backup() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir(home.path().join(".claude")).unwrap();
+        let settings = home.path().join(".claude/settings.json");
+        fs::write(&settings, SHARED_GROUP).unwrap();
+
+        install(home.path(), &exe(), 100).unwrap();
+        let after_first = fs::read_to_string(&settings).unwrap();
+        let files_after_first = fs::read_dir(home.path().join(".claude")).unwrap().count();
+
+        let ids = install(home.path(), &exe(), 200).unwrap();
+        assert_eq!(ids, vec!["claude".to_string()]);
+        assert!(!home.path().join(".claude/settings.json.agent-pin-backup-200").exists());
+        assert_eq!(
+            fs::read_dir(home.path().join(".claude")).unwrap().count(),
+            files_after_first
+        );
+        assert_eq!(fs::read_to_string(&settings).unwrap(), after_first);
     }
 
     #[test]

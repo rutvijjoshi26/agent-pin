@@ -11,7 +11,7 @@ use crate::store::update_session;
 
 /// Most bytes of stdin a hook parses. A larger payload is drained and only
 /// its `session_id` and `cwd` are salvaged from the first `STDIN_MAX` bytes.
-const STDIN_MAX: u64 = 1 << 20;
+pub const STDIN_MAX: u64 = 1 << 20;
 
 /// Runs one hook event. `args` is `[provider, event_name]`; `stdin` is the
 /// hook's JSON payload. Payloads over 1 MB keep only `session_id` and `cwd`
