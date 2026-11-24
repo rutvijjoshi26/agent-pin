@@ -3,8 +3,11 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agent_pin_core::approvals::{self, Behavior, Request};
+use agent_pin_core::install::HookStatus;
 use agent_pin_core::rows::Row;
 use agent_pin_core::{build_rows, install, store};
 use serde::Serialize;
@@ -16,6 +19,12 @@ const SCREEN_MARGIN: f64 = 20.0;
 const PRUNE_AFTER_MS: i64 = 259_200_000;
 /// How often the app prunes session files after the one at start.
 const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// How often the app refreshes `app.alive`; the hook needs it < 3 s old.
+const HEARTBEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// True once the app is exiting. Held while `app.alive` is written, so no
+/// heartbeat can recreate the file after exit has removed it.
+static HEARTBEAT_STOPPED: Mutex<bool> = Mutex::new(false);
 
 const NO_STATE_DIR: &str = "no state directory: set AGENT_PIN_HOME or the home directory";
 const NO_HOME: &str = "Could not resolve home directory";
@@ -23,7 +32,10 @@ const NO_HOME: &str = "Could not resolve home directory";
 #[derive(Serialize)]
 struct ProviderIntegration {
     id: String,
+    /// Kept for older frontends: `status == Current`.
     installed: bool,
+    /// `"missing"`, `"stale"` (needs updating) or `"current"`.
+    status: HookStatus,
 }
 
 #[derive(Serialize)]
@@ -50,15 +62,62 @@ fn mark_seen(key: String) -> Result<(), String> {
 fn read_integrations() -> Integrations {
     let providers = home_dir()
         .zip(hook_exe().ok())
-        .map(|(home, exe)| install::installed(&home, &exe))
+        .map(|(home, exe)| install::status(&home, &exe))
         .unwrap_or_default()
         .into_iter()
-        .map(|(id, installed)| ProviderIntegration { id, installed })
+        .map(|(id, status)| ProviderIntegration {
+            id,
+            installed: status == HookStatus::Current,
+            status,
+        })
         .collect();
     Integrations {
         providers,
         wayland: wayland_session(),
     }
+}
+
+/// Pending approval requests whose session is still waiting for approval,
+/// oldest first. Deletes the request files of the rest, best effort: their
+/// session has moved on (e.g. the user answered in the terminal).
+#[tauri::command]
+fn read_approvals() -> Vec<Request> {
+    let Some(dir) = store::state_dir() else {
+        return Vec::new();
+    };
+    let now = now_ms();
+    // Requests before rows: see `approvals::pending_for_rows`.
+    let pending = approvals::list_pending(&dir, now);
+    if pending.is_empty() {
+        return pending;
+    }
+    let rows = build_rows(&store::list_sessions(&dir), now);
+    let (keep, stale) = approvals::pending_for_rows(pending, &rows);
+    approvals::remove(&dir, &stale);
+    keep
+}
+
+/// Answers request `id` with Allow or Deny.
+#[tauri::command]
+fn decide(id: String, allow: bool) -> Result<(), String> {
+    let dir = store::state_dir().ok_or(NO_STATE_DIR)?;
+    let behavior = if allow { Behavior::Allow } else { Behavior::Deny };
+    approvals::decide(&dir, &id, behavior).map_err(|error| error.to_string())
+}
+
+/// Whether approving from Agent Pin is on (the default).
+#[tauri::command]
+fn approvals_enabled() -> bool {
+    let Some(dir) = store::state_dir() else {
+        return true;
+    };
+    approvals::enabled(&dir)
+}
+
+#[tauri::command]
+fn set_approvals_enabled(on: bool) -> Result<(), String> {
+    let dir = store::state_dir().ok_or(NO_STATE_DIR)?;
+    approvals::set_enabled(&dir, on).map_err(|error| error.to_string())
 }
 
 /// Installs hooks. Called only when the user clicks Set up, never on launch.
@@ -167,25 +226,62 @@ fn validate_install_exe_path(_path: &Path) -> Result<(), String> {
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             read_rows,
             mark_seen,
             read_integrations,
             install_integrations,
+            read_approvals,
+            decide,
+            approvals_enabled,
+            set_approvals_enabled,
             fit_window,
             start_window_drag
         ])
         .setup(|app| {
             spawn_pruner();
+            spawn_heartbeat();
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_always_on_top(true);
                 let _ = position_top_right(&window);
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running Agent Pin");
+    app.run(|_app, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            stop_heartbeat();
+        }
+    });
+}
+
+/// Refreshes `app.alive` every second so hooks know the app can answer
+/// approval requests. Errors are ignored and a panic is caught, so the
+/// heartbeat never takes the app down.
+fn spawn_heartbeat() {
+    std::thread::spawn(|| loop {
+        let _ = std::panic::catch_unwind(|| {
+            let stopped = HEARTBEAT_STOPPED.lock().unwrap_or_else(|e| e.into_inner());
+            if !*stopped {
+                if let Some(dir) = store::state_dir() {
+                    let _ = approvals::write_alive(&dir, now_ms());
+                }
+            }
+        });
+        std::thread::sleep(HEARTBEAT_EVERY);
+    });
+}
+
+/// Stops the heartbeat and removes `app.alive`, best effort, so waiting
+/// hooks give up at once instead of after the file goes stale.
+fn stop_heartbeat() {
+    let mut stopped = HEARTBEAT_STOPPED.lock().unwrap_or_else(|e| e.into_inner());
+    *stopped = true;
+    if let Some(dir) = store::state_dir() {
+        let _ = std::fs::remove_file(dir.join("app.alive"));
+    }
 }
 
 /// Prunes stale session files now and then every hour, on a background
