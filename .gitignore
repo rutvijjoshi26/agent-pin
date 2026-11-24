@@ -5,3 +5,4 @@ dist/
 apps/desktop/node_modules/
 apps/desktop/src-tauri/target/
 .DS_Store
+crates/*/target/
