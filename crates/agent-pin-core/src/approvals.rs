@@ -62,6 +62,10 @@ pub struct Request {
     /// Pretty-printed `tool_input`, at most 4000 chars, no control chars
     /// other than newlines and no invisible format characters.
     pub detail: String,
+    /// True when `detail` was cut at the 4000-char cap. Such a request can
+    /// only be denied from Agent Pin. Absent in older files: false.
+    #[serde(default)]
+    pub truncated: bool,
     pub created_ms: i64,
     pub deadline_ms: i64,
 }
@@ -176,6 +180,7 @@ pub fn new_request(provider: &str, session_key: &str, input: &HookInput, now_ms:
         .as_ref()
         .and_then(|v| serde_json::to_string_pretty(v).ok())
         .unwrap_or_default();
+    let (detail, truncated) = sanitize_flagged(&detail, DETAIL_MAX, true);
     Request {
         id,
         provider: provider.to_owned(),
@@ -185,7 +190,8 @@ pub fn new_request(provider: &str, session_key: &str, input: &HookInput, now_ms:
             .unwrap_or_default(),
         tool_name: sanitize(input.tool_name.as_deref().unwrap_or("Tool"), TEXT_MAX, false),
         summary: sanitize(&pending_raw(input), TEXT_MAX, false),
-        detail: sanitize(&detail, DETAIL_MAX, true),
+        detail,
+        truncated,
         created_ms: now_ms,
         deadline_ms: now_ms + WAIT_MS,
     }
@@ -223,15 +229,20 @@ fn is_invisible(c: char) -> bool {
 /// spaces (keeping `\n` when `keep_newlines`), then truncates to at most
 /// `max_chars` counting the trailing `…`.
 fn sanitize(s: &str, max_chars: usize, keep_newlines: bool) -> String {
+    sanitize_flagged(s, max_chars, keep_newlines).0
+}
+
+/// [`sanitize`], also reporting whether the text was cut.
+fn sanitize_flagged(s: &str, max_chars: usize, keep_newlines: bool) -> (String, bool) {
     let cleaned: String = s
         .chars()
         .filter(|c| !is_invisible(*c))
         .map(|c| if c.is_control() && !(keep_newlines && c == '\n') { ' ' } else { c })
         .collect();
     if cleaned.chars().count() > max_chars {
-        truncate(&cleaned, max_chars.saturating_sub(1))
+        (truncate(&cleaned, max_chars.saturating_sub(1)), true)
     } else {
-        cleaned
+        (cleaned, false)
     }
 }
 
@@ -444,7 +455,7 @@ impl Drop for Cleanup<'_> {
 /// gives up if its own request file is gone (the app dismissed it), else
 /// refreshes the request file's mtime so the app knows this hook is still
 /// waiting (see [`HOOK_STALE_MS`]), then gives up at its `deadline_ms` or
-/// as soon as the app is not alive. A
+/// as soon as the app is not alive or approvals are switched off. A
 /// decision file that is not exactly an allow or deny yields `None`.
 /// Removes the request and decision files before returning.
 pub fn wait(
@@ -476,7 +487,7 @@ pub fn wait(
             .open(&req)
             .and_then(|f| f.set_modified(SystemTime::now()));
         let t = now();
-        if t >= r.deadline_ms || !app_alive(dir, t) {
+        if t >= r.deadline_ms || !app_alive(dir, t) || !enabled(dir) {
             return None;
         }
         sleep(Duration::from_millis(POLL_MS));
@@ -689,6 +700,42 @@ mod tests {
         let (got, sleeps) = run_wait(dir, posted, T0 + 60_000, false, |_| {});
         assert_eq!((got, sleeps), (None, 0));
         assert!(!req_path(dir, &r.id).exists());
+    }
+
+    #[test]
+    fn truncated_flag_set_only_when_detail_cut() {
+        let big = serde_json::json!({
+            "tool_name": "Write",
+            "tool_input": {"content": "x".repeat(10_000)},
+        })
+        .to_string();
+        let r = new_request("claude", "s1", &HookInput::from_json(&big).unwrap(), T0);
+        assert!(r.truncated);
+        let r = new_request("claude", "s1", &bash("ls"), T0);
+        assert!(!r.truncated);
+        // Old request files have no such field.
+        let mut v = serde_json::to_value(&r).unwrap();
+        v.as_object_mut().unwrap().remove("truncated");
+        let old: Request = serde_json::from_value(v).unwrap();
+        assert!(!old.truncated);
+    }
+
+    #[test]
+    fn wait_returns_none_once_approvals_switched_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_alive(dir, T0).unwrap();
+        let r = new_request("claude", "s1", &bash("ls"), T0);
+        let posted = post(dir, &r).unwrap();
+        let (got, sleeps) = run_wait(dir, posted, T0, true, |t| {
+            if t >= T0 + 400 {
+                set_enabled(dir, false).unwrap();
+            }
+        });
+        assert_eq!(got, None);
+        assert_eq!(sleeps, 2, "returns on the poll after the switch");
+        assert!(!req_path(dir, &r.id).exists());
+        assert!(!dec_path(dir, &r.id).exists());
     }
 
     #[test]

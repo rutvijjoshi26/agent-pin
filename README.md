@@ -80,7 +80,7 @@ One deliberate choice worth noting: Claude's `Notification` hook is **not** used
 
 ## Approve from Agent Pin
 
-When Claude Code or Codex asks for permission, the session's row shows the request with **Allow** and **Deny** buttons. It shows the request's summary, for example `Bash: rm -rf build`, and below the buttons the tool's input as formatted JSON in a scrollable box: the first 8 lines, then a count of any more. Input longer than 4000 characters is cut short. The buttons stay if the row flips back to running while the request waits, which subagents and parallel tool calls can cause. They are hidden while the pin is collapsed to status dots.
+When Claude Code or Codex asks for permission, the session's row shows the request with **Allow** and **Deny** buttons. It shows the request's summary, for example `Bash: rm -rf build`, and below the buttons the tool's input as formatted JSON in a scrollable box, every line of it. Input longer than 4000 characters is cut short; a request cut short cannot be allowed from Agent Pin. Its card says "Too long to show in full. Answer in the terminal." and offers **Deny** only. The buttons stay if the row flips back to running while the request waits, which subagents and parallel tool calls can cause. They are hidden while the pin is collapsed to status dots.
 
 ### How it works
 
@@ -94,7 +94,7 @@ When Claude Code or Codex asks for permission, the session's row shows the reque
 The hook prints nothing, and the agent falls back to its normal permission prompt, when:
 
 - **Agent Pin isn't running.** The app refreshes `app.alive` in the state directory every second, and the hook treats a file 3 s old as a stopped app. A hook started without the app returns at once. One that is waiting when the app quits or crashes returns within about 3 s.
-- **Approvals are switched off.** Untick **Approve from Agent Pin** in the setup panel. This applies to new requests; a request already on a card stays until it is answered or dropped.
+- **Approvals are switched off.** Untick **Approve from Agent Pin** in the setup panel. This takes effect at once: a hook that is already waiting checks the switch on every 200 ms poll, returns with no decision and removes its request, so its card goes away and the agent shows its normal prompt.
 - **No click within about 10 minutes.** The hook gives up after 590 s, inside its 600 s timeout.
 - **The card is dropped.** The app drops a request when its session has completed, gone idle or errored, and when its hook has stopped refreshing the request file for about 5 s (the hook refreshes it every 200 ms while it waits). A waiting hook whose request is dropped returns with no decision.
 - **Anything goes wrong**, such as a file that can't be written or read, or a decision file that isn't exactly an Allow or a Deny.
@@ -107,12 +107,14 @@ In an interactive terminal session, the terminal also shows its own permission p
 
 After you answer in the terminal, the card may stay until the session finishes. Clicking it then has no effect.
 
-Headless runs (`claude -p`) and background sessions have no prompt to answer, so they wait for a click whenever the app is running and approvals are on. To get their normal behaviour back, which in headless mode is a denial, switch approvals off.
+Headless runs (`claude -p`) and background sessions have no prompt to answer, so they wait for a click whenever the app is running and approvals are on. To get their normal behaviour back, which in headless mode is a denial, switch approvals off; a run already waiting is released at once.
+
+The Claude Code headless docs ([Run Claude Code programmatically](https://code.claude.com/docs/en/headless)) say: "In a Manual mode `claude -p` run, a call that needs approval is denied unless something approves it, such as a `PermissionRequest` hook or a `--permission-prompt-tool`." The hooks reference ([Hooks](https://code.claude.com/docs/en/hooks)) says the same for a `-p` run with no permission host: nobody can answer the prompt, so a call that would prompt is denied unless something, such as a `PermissionRequest` hook, approves it. That is the behaviour Agent Pin relies on. Other permission modes (for example `dontAsk` or `acceptEdits`) change which calls prompt at all, so a click is only asked for calls that would otherwise prompt.
 
 ### Settings and Codex
 
-- An Allow never overrides a `deny` rule in your Claude Code settings. The Claude Code hooks docs say a hook's allow can't override one.
-- Codex is supported through its `PermissionRequest` hook, following Codex's hooks docs. After **Set up**, run `/hooks` in Codex to trust the updated hook. Until you do, Codex skips it and prompts as usual.
+- An Allow never overrides a `deny` rule in your Claude Code settings. The hooks reference says a `PermissionRequest` hook cannot approve a call that a deny rule refuses, unless an installed Claude Code mod overrides the rule ([Hooks](https://code.claude.com/docs/en/hooks); see also [Precedence among rules, hooks, and mods](https://code.claude.com/docs/en/permissions#precedence-among-rules-hooks-and-mods)).
+- Codex is supported through its `PermissionRequest` hook. The Codex hooks docs ([Hooks](https://learn.chatgpt.com/docs/hooks), which `https://developers.openai.com/codex/hooks` redirects to) say that non-managed hooks must be reviewed and trusted before they run, and that new or changed hooks are marked for review and skipped until trusted. After **Set up**, run `/hooks` in Codex to trust the updated hook. Until you do, Codex skips it and prompts as usual.
 
 ### Upgrading
 

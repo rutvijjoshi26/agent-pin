@@ -177,8 +177,6 @@ export function setupView(integrations, note) {
   };
 }
 
-const MAX_DETAIL_LINES = 8;
-
 /**
  * The pending approval request for a row (key `provider__session_key`), or
  * null. With several, the newest by created_ms wins.
@@ -207,21 +205,27 @@ export function rowApproval(row, approvals) {
 }
 
 /**
- * Everything being approved: the request's summary (or tool name), then up
- * to 8 lines of its detail, then "… N more lines" for the rest. Lines are
- * kept whole; the view wraps them rather than clipping.
+ * Everything being approved: the request's summary (or tool name), then
+ * every line of its detail. Lines are kept whole; the view scrolls and
+ * wraps them rather than clipping.
  */
 export function approvalLines(req) {
   if (!req) {
     return [];
   }
   const all = req.detail ? String(req.detail).split(/\r?\n/) : [];
-  const lines = [approvalTitle(req), ...all.slice(0, MAX_DETAIL_LINES)];
-  const more = all.length - MAX_DETAIL_LINES;
-  if (more > 0) {
-    lines.push(`… ${more} more ${more === 1 ? "line" : "lines"}`);
+  return [approvalTitle(req), ...all];
+}
+
+/**
+ * Which buttons a request offers. A request whose detail was cut cannot be
+ * judged from what is shown, so it is Deny only, with a note.
+ */
+export function approvalChoices(req) {
+  if (req && req.truncated === true) {
+    return { allow: false, deny: true, note: "Too long to show in full. Answer in the terminal." };
   }
-  return lines;
+  return { allow: true, deny: true, note: null };
 }
 
 /** "Allow Bash: rm -rf build" or "Deny Bash: rm -rf build". */

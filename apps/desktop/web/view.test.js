@@ -6,6 +6,7 @@ import {
   ageText,
   approvalButtonLabel,
   approvalFor,
+  approvalChoices,
   approvalLines,
   decisionFailed,
   decisionSent,
@@ -354,7 +355,7 @@ test("rowApproval offers a decision on waiting and running rows only", () => {
   assert.equal(rowApproval({ key: "claude__s2", status: "waiting_approval" }, list), null);
 });
 
-test("approvalLines is the summary then up to 8 detail lines", () => {
+test("approvalLines is the summary then every detail line", () => {
   const eight = ["{", "  a", "  b", "  c", "  d", "  e", "  f", "}"];
   assert.deepEqual(approvalLines(req("claude", "s1", 1, { detail: eight.join("\n") })), [
     "Bash: rm -rf build",
@@ -366,18 +367,25 @@ test("approvalLines is the summary then up to 8 detail lines", () => {
   assert.deepEqual(approvalLines(null), []);
 });
 
-test("approvalLines marks the lines past 8", () => {
-  const nine = Array.from({ length: 9 }, (_, i) => `l${i + 1}`);
-  assert.deepEqual(approvalLines(req("claude", "s1", 1, { detail: nine.join("\n") })), [
-    "Bash: rm -rf build",
-    ...nine.slice(0, 8),
-    "… 1 more line"
-  ]);
+test("approvalLines never drops or summarises lines", () => {
   const twenty = Array.from({ length: 20 }, (_, i) => `l${i + 1}`);
   const lines = approvalLines(req("claude", "s1", 1, { detail: twenty.join("\n") }));
-  assert.equal(lines.length, 10);
-  assert.equal(lines[8], "l8");
-  assert.equal(lines[9], "… 12 more lines");
+  assert.deepEqual(lines, ["Bash: rm -rf build", ...twenty]);
+  assert.ok(!lines.some((line) => line.includes("more line")));
+});
+
+test("approvalChoices offers Allow and Deny unless the detail was cut", () => {
+  assert.deepEqual(approvalChoices(req("claude", "s1", 1)), { allow: true, deny: true, note: null });
+  assert.deepEqual(approvalChoices(req("claude", "s1", 1, { truncated: false })), {
+    allow: true,
+    deny: true,
+    note: null
+  });
+  assert.deepEqual(approvalChoices(req("claude", "s1", 1, { truncated: true })), {
+    allow: false,
+    deny: true,
+    note: "Too long to show in full. Answer in the terminal."
+  });
 });
 
 test("approvalLines keeps a long line whole for wrapping", () => {

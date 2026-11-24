@@ -4,6 +4,7 @@ import {
   HOLD_MAX_MS,
   ageText,
   approvalButtonLabel,
+  approvalChoices,
   approvalLines,
   cardCatchUp,
   catchUpLines,
@@ -352,7 +353,11 @@ function approvalStrip(request, rowKey) {
   const [summary, ...detail] = approvalLines(request);
   node.appendChild(el("div", "approval__summary", summary));
   const actions = el("div", "approval__actions");
+  const choices = approvalChoices(request);
   for (const allow of [true, false]) {
+    if (allow && !choices.allow) {
+      continue;
+    }
     const button = el(
       "button",
       `approval__button ${allow ? "approval__button--allow" : "approval__button--deny"}`,
@@ -370,6 +375,8 @@ function approvalStrip(request, rowKey) {
   node.appendChild(actions);
   if (view.note) {
     node.appendChild(approvalNote(view.note));
+  } else if (choices.note) {
+    node.appendChild(approvalNote(choices.note));
   }
   if (detail.length) {
     const block = el("div", "approval__detail");
