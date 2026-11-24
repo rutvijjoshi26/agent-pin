@@ -2,22 +2,25 @@
 //! never blocks for long: errors are returned for the caller to print to
 //! stderr before exiting 0.
 
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::PathBuf;
 
 use crate::input::{normalize_provider, HookInput, HookKind};
 use crate::session::{apply, session_key};
 use crate::store::update_session;
 
-/// Most bytes of stdin a hook reads; anything beyond is ignored.
+/// Most bytes of stdin a hook parses. A larger payload is drained and only
+/// its `session_id` and `cwd` are salvaged from the first `STDIN_MAX` bytes.
 const STDIN_MAX: u64 = 1 << 20;
 
 /// Runs one hook event. `args` is `[provider, event_name]`; `stdin` is the
-/// hook's JSON payload, of which at most 1 MB is read. The caller bounds
-/// how long reading `stdin` can take. Errors are returned, never panicked.
+/// hook's JSON payload. Payloads over 1 MB keep only `session_id` and `cwd`
+/// (salvaged from the prefix) so the status still moves; without a
+/// salvageable `session_id` the event is skipped. The caller bounds how
+/// long reading `stdin` can take. Errors are returned, never panicked.
 pub fn run_hook(
     args: &[String],
-    stdin: impl Read,
+    mut stdin: impl Read,
     state_dir: Option<PathBuf>,
     now_ms: i64,
 ) -> Result<(), String> {
@@ -25,17 +28,73 @@ pub fn run_hook(
         return Err("usage: agent-pin hook <provider> <event>".to_owned());
     };
     let mut raw = Vec::new();
-    stdin
-        .take(STDIN_MAX)
+    (&mut stdin)
+        .take(STDIN_MAX + 1)
         .read_to_end(&mut raw)
         .map_err(|e| format!("reading hook stdin: {e}"))?;
-    let dir = state_dir.ok_or("no state directory: set AGENT_PIN_HOME or HOME")?;
+    let oversized = raw.len() as u64 > STDIN_MAX;
+    if oversized {
+        // Drain the rest so the writer never sees a broken pipe.
+        let _ = io::copy(&mut stdin, &mut io::sink());
+    }
+    let dir = state_dir.ok_or("no state directory: set AGENT_PIN_HOME or the home directory")?;
     let provider = normalize_provider(provider);
     let kind = HookKind::parse(event);
-    let input = HookInput::from_json_lossy(&String::from_utf8_lossy(&raw));
+    let input = if oversized {
+        raw.truncate(STDIN_MAX as usize);
+        let Some(session_id) = salvage_string(&raw, "session_id") else {
+            return Ok(());
+        };
+        HookInput {
+            session_id: Some(session_id),
+            cwd: salvage_string(&raw, "cwd"),
+            ..HookInput::default()
+        }
+    } else {
+        HookInput::from_json_lossy(&String::from_utf8_lossy(&raw))
+    };
     let key = session_key(&input);
     update_session(&dir, &provider, &key, |prev| apply(prev, &provider, kind, &input, now_ms))
         .map_err(|e| format!("updating session {provider}__{key}: {e}"))
+}
+
+/// Finds the first `"<key>"`, optional whitespace, `:`, optional whitespace
+/// and a complete JSON string in `raw`, and returns the decoded string.
+/// Used on a truncated payload, so an unterminated value yields `None`.
+fn salvage_string(raw: &[u8], key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let needle = needle.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = find(&raw[from..], needle) {
+        let after = from + pos + needle.len();
+        if let Some(value) = string_after_colon(&raw[after..]) {
+            return Some(value);
+        }
+        from = after;
+    }
+    None
+}
+
+/// Parses `ws : ws "..."` at the start of `rest`.
+fn string_after_colon(rest: &[u8]) -> Option<String> {
+    let rest = rest.trim_ascii_start().strip_prefix(b":")?.trim_ascii_start();
+    if rest.first() != Some(&b'"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (i, &b) in rest.iter().enumerate().skip(1) {
+        match b {
+            _ if escaped => escaped = false,
+            b'\\' => escaped = true,
+            b'"' => return serde_json::from_slice(&rest[..=i]).ok(),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
@@ -96,15 +155,57 @@ mod tests {
         assert_eq!(all[0].updated_ms, 6);
     }
 
+    /// A payload of more than 1 MB: `head` then a huge `tool_response`.
+    fn oversized(head: &str) -> String {
+        format!(r#"{{{head}"tool_response":"{}"}}"#, "x".repeat(3 << 20))
+    }
+
     #[test]
-    fn oversized_stdin_is_capped_not_err() {
+    fn oversized_payload_updates_real_session() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
-        // 3 MB of stdin: only 1 MB is read, which is not valid JSON, so
-        // the event lands on the default session.
-        let big = format!(r#"{{"session_id":"big","prompt":"{}"}}"#, "x".repeat(3 << 20));
-        run_hook(&args("claude", "UserPromptSubmit"), big.as_bytes(), Some(dir.clone()), 1).unwrap();
-        assert!(session_file(&dir, "claude__default").is_file());
+        let start = br#"{"session_id":"s1","cwd":"/repo"}"#;
+        run_hook(&args("claude", "PermissionRequest"), &start[..], Some(dir.clone()), 1).unwrap();
+        assert_eq!(list_sessions(&dir)[0].status, Status::WaitingApproval);
+        let big = oversized(r#""session_id" : "s1", "cwd":"/repo","tool_name":"Bash","#);
+        run_hook(&args("claude", "PostToolUse"), big.as_bytes(), Some(dir.clone()), 2).unwrap();
+        assert!(!session_file(&dir, "claude__default").exists());
+        let all = list_sessions(&dir);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].session_key, "s1");
+        assert_eq!(all[0].status, Status::Running);
+        assert_eq!(all[0].updated_ms, 2);
+        assert_eq!(all[0].cwd.as_deref(), Some("/repo"));
+    }
+
+    #[test]
+    fn oversized_payload_without_session_id_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let big = oversized(r#""cwd":"/repo","#);
+        run_hook(&args("claude", "PostToolUse"), big.as_bytes(), Some(dir.clone()), 1).unwrap();
+        let sessions = dir.join("sessions");
+        let jsons = fs::read_dir(&sessions)
+            .map(|rd| rd.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "json")).count())
+            .unwrap_or(0);
+        assert_eq!(jsons, 0);
+    }
+
+    #[test]
+    fn salvage_handles_escaped_quote() {
+        let raw = br#"{"session_id":"a\"b\\","cwd":"C:\\dir \"q\"","x":1"#;
+        assert_eq!(salvage_string(raw, "session_id").as_deref(), Some("a\"b\\"));
+        assert_eq!(salvage_string(raw, "cwd").as_deref(), Some("C:\\dir \"q\""));
+        // An unterminated value (cut off by the cap) is not salvaged.
+        assert_eq!(salvage_string(br#"{"session_id":"abc"#, "session_id"), None);
+        assert_eq!(salvage_string(br#"{"other":"v"}"#, "session_id"), None);
+        assert_eq!(salvage_string(br#"{"session_id":42}"#, "session_id"), None);
+        // Via the hook: the escaped quote is dropped by key sanitizing.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let big = oversized(r#""session_id":"a\"b","#);
+        run_hook(&args("claude", "PostToolUse"), big.as_bytes(), Some(dir.clone()), 1).unwrap();
+        assert!(session_file(&dir, "claude__ab").is_file());
     }
 
     #[test]
