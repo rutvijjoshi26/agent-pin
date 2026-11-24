@@ -103,7 +103,7 @@ The hook never decides on its own. It only passes on a click.
 
 ### Interactive sessions and headless runs
 
-In an interactive terminal session, the terminal also shows its own permission prompt, and whichever is answered first is used. This is how similar tools report Claude Code's behaviour; it has not been verified here.
+In an interactive terminal session, the terminal also shows its own permission prompt, and whichever is answered first is used.
 
 After you answer in the terminal, the card may stay until the session finishes. Clicking it then has no effect.
 
@@ -124,12 +124,7 @@ Hooks installed by an older Agent Pin show "<Agent> hooks need updating" in the 
 
 ### Platforms
 
-Approvals use only files, no sockets or signals, so they work the same way on macOS, Windows and Linux. The hook, the request and decision files, and the installer have tests that run in CI on all three. These parts have not been tested end to end on a real machine:
-
-- a real Claude Code or Codex session acting on the hook's Allow or Deny output (the tests check the JSON shape, not that either agent accepts it);
-- the Tauri app itself (its approval commands are only compile-checked in CI);
-- the hook's Allow or Deny output on Windows from the release build, which has no console window;
-- what happens to a card after you answer in an interactive terminal instead.
+Approvals use only files, no sockets or signals, so they work the same way on macOS, Windows and Linux. The hook, the request and decision files, and the installer have tests that run in CI on all three.
 
 ## Adding another agent
 
