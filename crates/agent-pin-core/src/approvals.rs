@@ -32,6 +32,9 @@ const DETAIL_MAX: usize = 4000;
 const TEXT_MAX: usize = 200;
 /// Temp files older than this are left over from a crash and swept.
 const TEMP_MAX_AGE: Duration = Duration::from_secs(60);
+/// An unparsable request file younger than this may still be being
+/// written, so the sweep keeps it.
+const UNPARSABLE_GRACE: Duration = Duration::from_secs(5);
 /// The message Claude Code and Codex show for a deny.
 const DENY_MESSAGE: &str = "Denied from Agent Pin";
 
@@ -207,12 +210,34 @@ fn sanitize(s: &str, max_chars: usize, keep_newlines: bool) -> String {
     }
 }
 
+/// Proof that [`post`] published a request. Only `post` makes one, and
+/// [`wait`] consumes it, so a wait can never run for a request this process
+/// did not publish (whose files, or planted decision, belong to someone
+/// else).
+///
+/// ```compile_fail
+/// use agent_pin_core::approvals::{new_request, Posted};
+/// let r = new_request("claude", "s1", &Default::default(), 0);
+/// let forged = Posted { request: r };
+/// ```
+#[derive(Debug)]
+pub struct Posted {
+    request: Request,
+}
+
+impl Posted {
+    /// The request that was published.
+    pub fn request(&self) -> &Request {
+        &self.request
+    }
+}
+
 /// Publishes `<dir>/approvals/<id>.req.json`, creating the approvals dir
 /// if needed. Never replaces anything: fails with `AlreadyExists` when the
 /// request or a decision for its id already exists, so a stale decision can
-/// never answer a new request. Rejects an id outside `[A-Za-z0-9_-]`. The
-/// hook must not [`wait`] after an error.
-pub fn post(dir: &Path, r: &Request) -> io::Result<()> {
+/// never answer a new request. Rejects an id outside `[A-Za-z0-9_-]`. Only
+/// the returned [`Posted`] lets the caller [`wait`].
+pub fn post(dir: &Path, r: &Request) -> io::Result<Posted> {
     check_stem(&r.id)?;
     let approvals = approvals_dir(dir);
     fs::create_dir_all(&approvals)?;
@@ -223,14 +248,16 @@ pub fn post(dir: &Path, r: &Request) -> io::Result<()> {
         ));
     }
     let body = serde_json::to_vec(r).map_err(io::Error::other)?;
-    publish_new(&approvals, &format!("{}.req.json", r.id), &body)
+    publish_new(&approvals, &format!("{}.req.json", r.id), &body)?;
+    Ok(Posted { request: r.clone() })
 }
 
 /// Every valid, unexpired request, oldest first. Also sweeps
 /// `<dir>/approvals`, best effort:
 /// - expired requests (`deadline_ms` passed), with any decision file;
-/// - request files that do not parse, or whose content `id` is not their
-///   file stem;
+/// - request files whose content `id` is not their file stem, and ones
+///   that do not parse once they are 5 s old (a younger one may still be
+///   being written);
 /// - decision files with no request that are older than [`WAIT_MS`];
 /// - temp files older than 60 s, and `<dir>/app.alive.tmp-*` likewise.
 ///
@@ -261,9 +288,14 @@ pub fn list_pending(dir: &Path, now_ms: i64) -> Vec<Request> {
                         remove_files(dir, stem);
                     }
                 }
-                _ => {
+                Ok(_) => {
                     let _ = fs::remove_file(&path);
                 }
+                // Possibly still being written: swept only once old.
+                Err(_) if older_than(&path, UNPARSABLE_GRACE) => {
+                    let _ = fs::remove_file(&path);
+                }
+                Err(_) => {}
             }
         } else if let Some(stem) = name.strip_suffix(".dec.json") {
             let orphan = !approvals.join(format!("{stem}.req.json")).exists();
@@ -329,17 +361,18 @@ impl Drop for Cleanup<'_> {
     }
 }
 
-/// Waits for the decision on `r`, polling every [`POLL_MS`] with the
+/// Waits for the decision on the posted request, polling every [`POLL_MS`] with the
 /// injected clock and sleep. Each poll first reads the decision file, then
-/// gives up at `r.deadline_ms` or as soon as the app is not alive. A
+/// gives up at its `deadline_ms` or as soon as the app is not alive. A
 /// decision file that is not exactly an allow or deny yields `None`.
 /// Removes the request and decision files before returning.
 pub fn wait(
     dir: &Path,
-    r: &Request,
+    posted: Posted,
     mut now: impl FnMut() -> i64,
     mut sleep: impl FnMut(Duration),
 ) -> Option<Behavior> {
+    let r = &posted.request;
     let _cleanup = Cleanup { dir, id: &r.id };
     check_stem(&r.id).ok()?;
     let dec = dec_path(dir, &r.id);
@@ -406,14 +439,14 @@ mod tests {
     /// app alive and running `on_sleep` after each tick.
     fn run_wait(
         dir: &Path,
-        r: &Request,
+        posted: Posted,
         start: i64,
         keep_alive: bool,
         mut on_sleep: impl FnMut(i64),
     ) -> (Option<Behavior>, usize) {
         let clock = Cell::new(start);
         let mut sleeps = 0;
-        let got = wait(dir, r, || clock.get(), |d| {
+        let got = wait(dir, posted, || clock.get(), |d| {
             sleeps += 1;
             assert_eq!(d, Duration::from_millis(POLL_MS));
             clock.set(clock.get() + d.as_millis() as i64);
@@ -509,20 +542,21 @@ mod tests {
         write_alive(dir, T0).unwrap();
         // Decided before the first poll.
         let r = new_request("claude", "s1", &bash("ls"), T0);
-        post(dir, &r).unwrap();
+        let posted = post(dir, &r).unwrap();
+        assert_eq!(posted.request(), &r);
         decide(dir, &r.id, Behavior::Allow).unwrap();
         let raw = fs::read_to_string(dec_path(dir, &r.id)).unwrap();
         assert_eq!(raw, r#"{"behavior":"allow"}"#);
-        let (got, sleeps) = run_wait(dir, &r, T0, true, |_| {});
+        let (got, sleeps) = run_wait(dir, posted, T0, true, |_| {});
         assert_eq!(got, Some(Behavior::Allow));
         assert_eq!(sleeps, 0);
         assert!(!req_path(dir, &r.id).exists());
         assert!(!dec_path(dir, &r.id).exists());
         // Decided mid-wait, after a few polls.
         let r = new_request("codex", "s2", &bash("ls"), T0);
-        post(dir, &r).unwrap();
+        let posted = post(dir, &r).unwrap();
         let id = r.id.clone();
-        let (got, sleeps) = run_wait(dir, &r, T0, true, |now| {
+        let (got, sleeps) = run_wait(dir, posted, T0, true, |now| {
             if now == T0 + 3 * POLL_MS as i64 {
                 decide(dir, &id, Behavior::Deny).unwrap();
             }
@@ -540,8 +574,8 @@ mod tests {
         write_alive(dir, T0).unwrap();
         let mut r = new_request("claude", "s1", &bash("ls"), T0);
         r.deadline_ms = T0 + 1000;
-        post(dir, &r).unwrap();
-        let (got, sleeps) = run_wait(dir, &r, T0, true, |_| {});
+        let posted = post(dir, &r).unwrap();
+        let (got, sleeps) = run_wait(dir, posted, T0, true, |_| {});
         assert_eq!(got, None);
         assert_eq!(sleeps, 5, "stops at the deadline");
         assert!(!req_path(dir, &r.id).exists());
@@ -554,16 +588,16 @@ mod tests {
         let dir = tmp.path();
         write_alive(dir, T0).unwrap();
         let r = new_request("claude", "s1", &bash("ls"), T0);
-        post(dir, &r).unwrap();
+        let posted = post(dir, &r).unwrap();
         // The app never refreshes app.alive after T0.
-        let (got, sleeps) = run_wait(dir, &r, T0, false, |_| {});
+        let (got, sleeps) = run_wait(dir, posted, T0, false, |_| {});
         assert_eq!(got, None);
         assert_eq!(sleeps as i64, ALIVE_MAX_AGE_MS / POLL_MS as i64);
         assert!(!req_path(dir, &r.id).exists());
         // Not alive at all: returns before sleeping.
         let r = new_request("claude", "s1", &bash("ls"), T0);
-        post(dir, &r).unwrap();
-        let (got, sleeps) = run_wait(dir, &r, T0 + 60_000, false, |_| {});
+        let posted = post(dir, &r).unwrap();
+        let (got, sleeps) = run_wait(dir, posted, T0 + 60_000, false, |_| {});
         assert_eq!((got, sleeps), (None, 0));
         assert!(!req_path(dir, &r.id).exists());
     }
@@ -575,9 +609,9 @@ mod tests {
         write_alive(dir, T0).unwrap();
         for body in [r#"{"behavior":"always"}"#, "garbage", ""] {
             let r = new_request("claude", "s1", &bash("ls"), T0);
-            post(dir, &r).unwrap();
+            let posted = post(dir, &r).unwrap();
             fs::write(dec_path(dir, &r.id), body).unwrap();
-            let (got, _) = run_wait(dir, &r, T0, true, |_| {});
+            let (got, _) = run_wait(dir, posted, T0, true, |_| {});
             assert_eq!(got, None, "{body:?}");
             assert!(!req_path(dir, &r.id).exists());
             assert!(!dec_path(dir, &r.id).exists());
@@ -595,8 +629,8 @@ mod tests {
         let a2 = new_request("claude", "a", &bash("ls"), T0);
         assert_ne!(a.id, a2.id);
         assert_ne!(a.id, b.id);
-        post(dir, &a).unwrap();
-        post(dir, &b).unwrap();
+        let posted_a = post(dir, &a).unwrap();
+        let posted_b = post(dir, &b).unwrap();
         let mut ids: Vec<String> = list_pending(dir, T0).into_iter().map(|r| r.id).collect();
         ids.sort();
         let mut want = vec![a.id.clone(), b.id.clone()];
@@ -604,10 +638,10 @@ mod tests {
         assert_eq!(ids, want);
         decide(dir, &b.id, Behavior::Deny).unwrap();
         decide(dir, &a.id, Behavior::Allow).unwrap();
-        assert_eq!(run_wait(dir, &b, T0, true, |_| {}).0, Some(Behavior::Deny));
+        assert_eq!(run_wait(dir, posted_b, T0, true, |_| {}).0, Some(Behavior::Deny));
         assert!(req_path(dir, &a.id).exists(), "a's files untouched by b's wait");
         assert!(dec_path(dir, &a.id).exists());
-        assert_eq!(run_wait(dir, &a, T0, true, |_| {}).0, Some(Behavior::Allow));
+        assert_eq!(run_wait(dir, posted_a, T0, true, |_| {}).0, Some(Behavior::Allow));
     }
 
     #[test]
@@ -769,6 +803,7 @@ mod tests {
         set_age(&orphan_old, old);
         let garbage = req_path(dir, "claude__junk__1__00000000000000cc");
         fs::write(&garbage, "{not json").unwrap();
+        set_age(&garbage, Duration::from_secs(6));
         let tmp_old = approvals.join("x.req.json.tmp-1-0");
         let tmp_new = approvals.join("x.req.json.tmp-1-1");
         let alive_tmp_old = dir.join("app.alive.tmp-1-0");
@@ -787,15 +822,34 @@ mod tests {
         assert!(!alive_tmp_old.exists() && alive_tmp_new.exists());
     }
 
+    /// A request file still being written (the `create_new` fallback of
+    /// `publish_new`) is not swept until it is at least 5 s old.
+    #[test]
+    fn young_unparsable_request_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::create_dir_all(dir.join("approvals")).unwrap();
+        let partial = req_path(dir, "claude__s1__1__00000000000000dd");
+        fs::write(&partial, r#"{"id":"claude__s1"#).unwrap();
+        assert!(list_pending(dir, T0).is_empty(), "not listed");
+        assert!(partial.exists(), "a young unparsable request is kept");
+        set_age(&partial, Duration::from_secs(4));
+        list_pending(dir, T0);
+        assert!(partial.exists(), "4 s old is still kept");
+        set_age(&partial, Duration::from_secs(6));
+        list_pending(dir, T0);
+        assert!(!partial.exists(), "swept once 5 s old");
+    }
+
     #[test]
     fn decision_with_unknown_fields_is_none() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         write_alive(dir, T0).unwrap();
         let r = new_request("claude", "s1", &bash("ls"), T0);
-        post(dir, &r).unwrap();
+        let posted = post(dir, &r).unwrap();
         fs::write(dec_path(dir, &r.id), r#"{"behavior":"allow","updatedInput":{}}"#).unwrap();
-        assert_eq!(run_wait(dir, &r, T0, true, |_| {}).0, None);
+        assert_eq!(run_wait(dir, posted, T0, true, |_| {}).0, None);
         assert!(!dec_path(dir, &r.id).exists());
     }
 
