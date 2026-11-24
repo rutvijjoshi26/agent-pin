@@ -37,7 +37,7 @@ impl HookKind {
 }
 
 /// The fields agent-pin reads from a hook's stdin JSON payload.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct HookInput {
     pub session_id: Option<String>,
     pub cwd: Option<String>,
