@@ -49,6 +49,9 @@ pub struct SessionState {
 
 /// Max chars kept for any free-text or path field.
 const TEXT_MAX: usize = 200;
+/// Max chars kept for an edited file path (long enough that collision keys
+/// stay faithful).
+const PATH_MAX: usize = 1024;
 /// Max items kept in `files` and `commands` (the most recent ones).
 const LIST_MAX: usize = 20;
 /// Max chars in a session key.
@@ -101,8 +104,10 @@ pub fn apply(
             s.status = Status::Running;
             let edits = matches!(tool, Some("Edit" | "Write" | "MultiEdit" | "NotebookEdit"));
             if let Some(path) = input.file_path.as_deref().filter(|_| edits) {
-                let path = absolute(s.cwd.as_deref(), path);
-                let touch = FileTouch { path: truncate(&path, TEXT_MAX), at_ms: now_ms };
+                // Join with the raw input cwd: the stored one may be truncated.
+                let cwd = input.cwd.as_deref().or(s.cwd.as_deref());
+                let path = absolute(cwd, path);
+                let touch = FileTouch { path: truncate(&path, PATH_MAX), at_ms: now_ms };
                 push_capped(&mut s.files, touch);
             }
         }
@@ -130,7 +135,8 @@ pub fn apply(
             s.pending = None;
         }
         HookKind::StopFailure => s.status = Status::Error,
-        HookKind::SessionEnd | HookKind::Other => unreachable!("handled above"),
+        // Returned early above; kept non-panicking so the hook never panics.
+        HookKind::SessionEnd | HookKind::Other => {}
     }
     Some(s)
 }
@@ -291,6 +297,34 @@ mod tests {
             let s = apply(Some(started()), "claude", HookKind::PreToolUse, &req, 2).unwrap();
             assert_eq!(s.files[0].path, p);
         }
+    }
+
+    #[test]
+    fn relative_path_joins_full_long_cwd() {
+        let cwd = format!("/{}", "d".repeat(300));
+        let req = HookInput { cwd: Some(cwd.clone()), ..tool("Edit", None, Some("a.rs")) };
+        let s = apply(Some(started()), "claude", HookKind::PreToolUse, &req, 2).unwrap();
+        assert_eq!(s.files[0].path, format!("{cwd}/a.rs"));
+    }
+
+    #[test]
+    fn relative_path_falls_back_to_stored_cwd() {
+        let req = HookInput { cwd: None, ..tool("Edit", None, Some("a.rs")) };
+        let s = apply(Some(started()), "claude", HookKind::PreToolUse, &req, 2).unwrap();
+        assert_eq!(s.files[0].path, "/r/a.rs");
+    }
+
+    #[test]
+    fn file_path_capped_at_1024_chars() {
+        let long = format!("/{}", "p".repeat(900));
+        let req = tool("Edit", None, Some(&long));
+        let s = apply(Some(started()), "claude", HookKind::PreToolUse, &req, 2).unwrap();
+        assert_eq!(s.files[0].path, long);
+        let huge = format!("/{}", "p".repeat(2000));
+        let req = tool("Edit", None, Some(&huge));
+        let s = apply(Some(started()), "claude", HookKind::PreToolUse, &req, 2).unwrap();
+        assert_eq!(s.files[0].path.chars().count(), 1025);
+        assert!(s.files[0].path.ends_with('…'));
     }
 
     #[test]
