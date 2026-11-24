@@ -1,6 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Agent Pin",
+  "mainBinaryName": "agent-pin",
   "version": "0.1.0",
   "identifier": "dev.agentpin.desktop",
   "build": {
@@ -20,8 +21,9 @@
         "transparent": true,
         "alwaysOnTop": true,
         "resizable": false,
-        "skipTaskbar": false,
-        "visible": true
+        "skipTaskbar": true,
+        "visible": true,
+        "visibleOnAllWorkspaces": true
       }
     ],
     "security": {
@@ -39,7 +41,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "shortDescription": "A floating status pin for Claude Code, Codex, and Antigravity",
-    "longDescription": "Agent Pin shows a small always-on-top status overlay for Claude Code, Codex, and Antigravity sessions."
+    "shortDescription": "A floating status pin for coding agents",
+    "longDescription": "Agent Pin shows a small always-on-top status overlay for coding-agent sessions such as Claude Code and Codex."
   }
 }
