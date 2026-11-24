@@ -43,7 +43,7 @@ export function catchUpLines(catchUp) {
   }
   const files = catchUp.files_since_seen || [];
   if (files.length > 0) {
-    lines.push(`Since you looked: ${files.length} files changed`);
+    lines.push(`Since you looked: ${files.length} ${files.length === 1 ? "file" : "files"} changed`);
   }
   const commands = catchUp.commands_since_seen || [];
   for (const run of commands.slice(-MAX_COMMANDS)) {
@@ -104,4 +104,56 @@ export function pressHold(interactive, nowMs) {
 /** True while a hold that started at `holdSince` is still in force. */
 export function isHeld(holdSince, nowMs) {
   return holdSince !== null && nowMs - holdSince < HOLD_MAX_MS;
+}
+
+const NO_CONFIG = "No Claude Code or Codex config found (~/.claude or ~/.codex)";
+
+/**
+ * The setup note after an install, from the provider ids it installed:
+ * Claude needs its hooks trusted via /hooks; Codex alone just confirms.
+ */
+export function installedNote(ids) {
+  const list = Array.isArray(ids) ? ids : [];
+  if (list.length === 0) {
+    return { title: "No agents found", text: NO_CONFIG };
+  }
+  if (list.includes("claude")) {
+    return { title: "Hooks installed", text: "Run /hooks in Claude Code to review and trust the new hooks" };
+  }
+  return { title: "Hooks installed", text: `${list.map(capitalize).join(" + ")} hooks installed` };
+}
+
+/**
+ * What the setup panel shows, from read_integrations' result (null when it
+ * failed) and the current note ({ title, text } or null).
+ */
+export function setupView(integrations, note) {
+  const providers = integrations && Array.isArray(integrations.providers) ? integrations.providers : null;
+  const missing = (providers || []).filter((provider) => !provider.installed).map((p) => capitalize(p.id));
+  const noConfig = providers !== null && providers.length === 0;
+  const wayland = Boolean(integrations && integrations.wayland);
+  let title = "Note";
+  let detail = "";
+  if (missing.length > 0) {
+    title = "Setup needed";
+    detail = note ? note.text : `${missing.join(" + ")} hooks missing`;
+  } else if (note) {
+    title = note.title;
+    detail = note.text;
+  } else if (noConfig) {
+    title = "No agents found";
+    detail = NO_CONFIG;
+  }
+  return {
+    visible: Boolean(detail) || wayland,
+    title,
+    detail,
+    wayland,
+    button: missing.length > 0
+  };
+}
+
+function capitalize(id) {
+  const text = String(id);
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }

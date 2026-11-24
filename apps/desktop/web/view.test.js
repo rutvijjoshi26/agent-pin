@@ -7,8 +7,10 @@ import {
   cardCatchUp,
   catchUpLines,
   collisionText,
+  installedNote,
   isHeld,
   pressHold,
+  setupView,
   statusMeta
 } from "./view.js";
 
@@ -168,4 +170,74 @@ test("an interactive press holds renders until it expires after 1.5 s", () => {
   assert.equal(isHeld(since, NOW + 1499), true);
   assert.equal(isHeld(since, NOW + 1500), false);
   assert.equal(isHeld(since, NOW + 60_000), false);
+});
+
+test("catchUpLines says 1 file vs N files", () => {
+  const base = { original_ask: null, current_ask: null, commands_since_seen: [], unseen: true };
+  assert.deepEqual(catchUpLines({ ...base, files_since_seen: ["/r/a.rs"] }), [
+    "Since you looked: 1 file changed"
+  ]);
+  assert.deepEqual(catchUpLines({ ...base, files_since_seen: ["/a", "/b", "/c"] }), [
+    "Since you looked: 3 files changed"
+  ]);
+});
+
+const NO_CONFIG = "No Claude Code or Codex config found (~/.claude or ~/.codex)";
+
+test("installedNote reflects what was installed", () => {
+  const trust = "Run /hooks in Claude Code to review and trust the new hooks";
+  assert.deepEqual(installedNote(["claude"]), { title: "Hooks installed", text: trust });
+  assert.deepEqual(installedNote(["claude", "codex"]), { title: "Hooks installed", text: trust });
+  assert.deepEqual(installedNote(["codex"]), { title: "Hooks installed", text: "Codex hooks installed" });
+  assert.deepEqual(installedNote([]), { title: "No agents found", text: NO_CONFIG });
+  assert.deepEqual(installedNote(undefined), { title: "No agents found", text: NO_CONFIG });
+});
+
+test("setupView asks for setup while hooks are missing", () => {
+  const view = setupView(
+    { providers: [{ id: "claude", installed: false }, { id: "codex", installed: true }], wayland: false },
+    null
+  );
+  assert.deepEqual(view, {
+    visible: true,
+    title: "Setup needed",
+    detail: "Claude hooks missing",
+    wayland: false,
+    button: true
+  });
+});
+
+test("setupView explains when no agent config exists", () => {
+  assert.deepEqual(setupView({ providers: [], wayland: false }, null), {
+    visible: true,
+    title: "No agents found",
+    detail: NO_CONFIG,
+    wayland: false,
+    button: false
+  });
+});
+
+test("setupView shows a note once everything is installed, else hides", () => {
+  const done = { providers: [{ id: "codex", installed: true }], wayland: false };
+  assert.equal(setupView(done, null).visible, false);
+  assert.deepEqual(setupView(done, installedNote(["codex"])), {
+    visible: true,
+    title: "Hooks installed",
+    detail: "Codex hooks installed",
+    wayland: false,
+    button: false
+  });
+  const wayland = setupView({ ...done, wayland: true }, null);
+  assert.equal(wayland.visible, true);
+  assert.equal(wayland.wayland, true);
+  assert.equal(wayland.title, "Note");
+  // An unreadable integrations result shows only the note, if any.
+  assert.equal(setupView(null, null).visible, false);
+  assert.deepEqual(setupView(null, { title: "Setup failed", text: "boom" }), {
+    visible: true,
+    title: "Setup failed",
+    detail: "boom",
+    wayland: false,
+    button: false
+  });
 });

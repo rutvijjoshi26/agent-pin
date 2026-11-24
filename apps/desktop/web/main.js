@@ -6,13 +6,14 @@ import {
   cardCatchUp,
   catchUpLines,
   collisionText,
+  installedNote,
   isHeld,
   pressHold,
+  setupView,
   statusMeta
 } from "./view.js";
 
 const POLL_MS = 800;
-const INSTALLED_MESSAGE = "Run /hooks in Claude Code to review and trust the new hooks";
 
 const invoke = (command, args) => window.__TAURI__.core.invoke(command, args);
 
@@ -36,7 +37,8 @@ let holdSince = null;
 let holdTimer = null;
 let renderPending = false;
 let integrations = null;
-let setupMessage = "";
+// The setup panel's note ({ title, text }) after an install or error, or null.
+let setupNote = null;
 let installing = false;
 let fittedSize = "";
 
@@ -103,13 +105,12 @@ function releaseHold() {
 
 setupButton.addEventListener("click", async () => {
   installing = true;
-  setupMessage = "Installing hooks...";
+  setupNote = { title: "Setting up", text: "Installing hooks..." };
   renderSetup();
   try {
-    await invoke("install_integrations");
-    setupMessage = INSTALLED_MESSAGE;
+    setupNote = installedNote(await invoke("install_integrations"));
   } catch (error) {
-    setupMessage = String(error);
+    setupNote = { title: "Setup failed", text: String(error) };
   } finally {
     installing = false;
     await refreshIntegrations();
@@ -261,30 +262,19 @@ function el(tag, className, text) {
   return node;
 }
 
-function missingProviders() {
-  if (!integrations || !Array.isArray(integrations.providers)) {
-    return [];
-  }
-  return integrations.providers
-    .filter((provider) => !provider.installed)
-    .map((provider) => provider.id.charAt(0).toUpperCase() + provider.id.slice(1));
-}
-
 function renderSetup() {
-  const missing = missingProviders();
-  const wayland = Boolean(integrations && integrations.wayland);
-  const visible = expanded && (missing.length > 0 || Boolean(setupMessage) || wayland);
+  const view = setupView(integrations, setupNote);
+  const visible = expanded && view.visible;
   setup.hidden = !visible;
   if (!visible) {
     return;
   }
 
-  setupTitle.textContent = missing.length ? "Setup needed" : setupMessage ? "Hooks installed" : "Note";
-  const detail = setupMessage || (missing.length ? `${missing.join(" + ")} hooks missing` : "");
-  setupDetail.textContent = detail;
-  setupDetail.hidden = !detail;
-  setupWayland.hidden = !wayland;
-  setupButton.hidden = !missing.length;
+  setupTitle.textContent = view.title;
+  setupDetail.textContent = view.detail;
+  setupDetail.hidden = !view.detail;
+  setupWayland.hidden = !view.wayland;
+  setupButton.hidden = !view.button;
   setupButton.disabled = installing;
   setupButton.textContent = installing ? "..." : "Set up";
 }
@@ -294,7 +284,7 @@ async function refreshIntegrations() {
     integrations = await invoke("read_integrations");
   } catch (error) {
     integrations = null;
-    setupMessage = String(error);
+    setupNote = { title: "Setup check failed", text: String(error) };
   }
   renderSetup();
 }
