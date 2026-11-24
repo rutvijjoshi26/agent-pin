@@ -2,6 +2,7 @@
 //! config files without touching the user's own hooks.
 
 use serde_json::Value;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -51,21 +52,48 @@ pub const PROVIDERS: &[Provider] = &[
 /// The exe is wrapped in double quotes with inner `"` escaped; backslashes are
 /// left alone so Windows paths stay valid.
 pub fn hook_command(exe: &Path, provider: &str, event: &str) -> String {
-    let exe = exe.display().to_string().replace('"', "\\\"");
-    format!("\"{exe}\" hook {provider} {event}")
+    format!("{}{provider} {event}", exe_prefix(exe))
 }
 
 /// True for commands agent-pin installed: the legacy Ruby `agent-pin-status`
-/// script, or an `agent-pin` binary invoked with the `hook` subcommand.
+/// script, an `agent-pin` binary invoked with the `hook` subcommand, or a
+/// command of exactly the [`hook_command`] shape whose quoted exe is named
+/// like Agent Pin in any case or separator style (an AppImage is named
+/// `Agent Pin_<version>_<arch>.AppImage`).
 pub fn is_agent_pin_command(cmd: &str) -> bool {
-    cmd.contains("agent-pin-status") || (cmd.contains("agent-pin") && cmd.contains(" hook "))
+    cmd.contains("agent-pin-status")
+        || (cmd.contains("agent-pin") && cmd.contains(" hook "))
+        || quoted_hook_exe(cmd).is_some_and(|exe| {
+            let name = exe.rsplit(['/', '\\']).next().unwrap_or(exe);
+            let squashed: String = name
+                .chars()
+                .filter(|c| !matches!(c, ' ' | '_' | '-' | '.'))
+                .flat_map(char::to_lowercase)
+                .collect();
+            squashed.contains("agentpin")
+        })
 }
 
-fn is_agent_pin_entry(entry: &Value) -> bool {
-    entry
-        .get("command")
-        .and_then(Value::as_str)
-        .is_some_and(is_agent_pin_command)
+/// The exe of a command shaped exactly like [`hook_command`] output:
+/// `"<exe>" hook <provider> <event>` with nothing after the event.
+fn quoted_hook_exe(cmd: &str) -> Option<&str> {
+    let rest = cmd.strip_prefix('"')?;
+    let end = rest.find("\" hook ")?;
+    let args: Vec<&str> = rest[end + "\" hook ".len()..].split(' ').collect();
+    let word = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    (args.len() == 2 && args.iter().all(|w| word(w))).then_some(&rest[..end])
+}
+
+/// True for an entry agent-pin owns: [`is_agent_pin_command`], or a hook
+/// command for the exe being installed (`"<exe>" hook …`).
+fn is_ours(cmd: &str, exe: &Path) -> bool {
+    is_agent_pin_command(cmd) || cmd.starts_with(&exe_prefix(exe))
+}
+
+/// `"<exe>" hook `, quoted exactly as [`hook_command`] quotes it.
+fn exe_prefix(exe: &Path) -> String {
+    let exe = exe.display().to_string().replace('"', "\\\"");
+    format!("\"{exe}\" hook ")
 }
 
 /// Removes every agent-pin command object from `config.hooks`, then appends
@@ -95,7 +123,12 @@ pub fn merge(config: &mut Value, provider: &Provider, exe: &Path) {
                 return true;
             };
             let had = entries.len();
-            entries.retain(|entry| !is_agent_pin_entry(entry));
+            entries.retain(|entry| {
+                !entry
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|cmd| is_ours(cmd, exe))
+            });
             !(entries.is_empty() && had > 0)
         });
         // Drop an event key only when our removals emptied it.
@@ -127,6 +160,21 @@ pub fn merge(config: &mut Value, provider: &Provider, exe: &Path) {
         slot.as_array_mut()
             .expect("array")
             .push(Value::Object(group));
+    }
+}
+
+/// The exe to install as the hook command. Inside an AppImage, `current`
+/// lives on a temporary mount, so the AppImage file (`APPIMAGE`) is used
+/// instead, but only when `current` really is inside this AppImage's mount
+/// (`APPDIR`): an `APPIMAGE` inherited from another AppImage, such as an
+/// editor whose terminal leaks it, is ignored. Empty values count as unset.
+pub fn choose_exe(current: PathBuf, appimage: Option<OsString>, appdir: Option<OsString>) -> PathBuf {
+    match (
+        appimage.filter(|v| !v.is_empty()),
+        appdir.filter(|v| !v.is_empty()),
+    ) {
+        (Some(image), Some(dir)) if current.starts_with(Path::new(&dir)) => PathBuf::from(image),
+        _ => current,
     }
 }
 
@@ -195,33 +243,32 @@ pub fn install(home: &Path, exe: &Path, now_secs: i64) -> Result<Vec<String>, St
 }
 
 /// One entry per provider whose config directory exists: true when its config
-/// holds the current agent-pin command for every event the provider uses.
-pub fn installed(home: &Path) -> Vec<(String, bool)> {
+/// holds exactly the command [`hook_command`] builds for `exe` for every event
+/// the provider uses. Hooks pointing at a moved or older exe read as false.
+pub fn installed(home: &Path, exe: &Path) -> Vec<(String, bool)> {
     PROVIDERS
         .iter()
         .filter(|provider| provider_dir_exists(home, provider))
         .map(|provider| {
             let config = read_config(&home.join(provider.config_rel)).ok().flatten();
             let ok = config.is_some_and(|config| {
-                provider
-                    .events
-                    .iter()
-                    .all(|event| has_current_command(&config, provider.id, event))
+                provider.events.iter().all(|event| {
+                    let want = hook_command(exe, provider.id, event);
+                    event_commands(&config, event).any(|cmd| cmd == want)
+                })
             });
             (provider.id.to_string(), ok)
         })
         .collect()
 }
 
-fn has_current_command(config: &Value, provider: &str, event: &str) -> bool {
-    let suffix = format!(" hook {provider} {event}");
+fn event_commands<'a>(config: &'a Value, event: &str) -> impl Iterator<Item = &'a str> {
     config["hooks"][event]
         .as_array()
         .into_iter()
         .flatten()
         .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
         .filter_map(|entry| entry["command"].as_str())
-        .any(|cmd| is_agent_pin_command(cmd) && cmd.ends_with(&suffix))
 }
 
 fn provider_dir_exists(home: &Path, provider: &Provider) -> bool {
@@ -282,6 +329,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::ffi::OsString;
     use std::path::PathBuf;
 
     const SHARED_GROUP: &str = include_str!("../tests/fixtures/claude_shared_group.json");
@@ -448,6 +496,12 @@ mod tests {
         assert!(is_agent_pin_command("\"/x/agent-pin\" hook claude Stop"));
         assert!(!is_agent_pin_command("/usr/bin/agent-pin --version"));
         assert!(!is_agent_pin_command("my-hook hook claude Stop"));
+        // AppImage names, in any case or separator style, in the exact shape.
+        assert!(is_agent_pin_command("\"/h/Agent Pin_0.1.0_amd64.AppImage\" hook claude Stop"));
+        assert!(is_agent_pin_command(r#""C:\Apps\Agent_Pin.exe" hook codex PreToolUse"#));
+        assert!(!is_agent_pin_command("\"/h/Agent Pin.AppImage\" hook claude Stop --x"));
+        assert!(!is_agent_pin_command("\"/h/Agent Pin/other\" hook claude Stop"));
+        assert!(!is_agent_pin_command("/h/AgentPin hook claude Stop"));
     }
 
     #[test]
@@ -462,7 +516,7 @@ mod tests {
         let text = fs::read_to_string(home.path().join(".codex/hooks.json")).unwrap();
         let config: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(agent_pin_entries(&config, "Stop").len(), 1);
-        assert_eq!(installed(home.path()), vec![("codex".to_string(), true)]);
+        assert_eq!(installed(home.path(), &exe()), vec![("codex".to_string(), true)]);
     }
 
     #[test]
@@ -480,7 +534,7 @@ mod tests {
         assert_eq!(claude_dir.len(), 1);
         assert_eq!(fs::read_dir(home.path().join(".codex")).unwrap().count(), 0);
         assert_eq!(
-            installed(home.path()),
+            installed(home.path(), &exe()),
             vec![("claude".to_string(), false), ("codex".to_string(), false)]
         );
     }
@@ -512,7 +566,7 @@ mod tests {
         assert_eq!(keys, ["model", "hooks", "permissions"]);
         // No temp files left behind; only settings + backup.
         assert_eq!(fs::read_dir(home.path().join(".claude")).unwrap().count(), 2);
-        assert_eq!(installed(home.path()), vec![("claude".to_string(), true)]);
+        assert_eq!(installed(home.path(), &exe()), vec![("claude".to_string(), true)]);
 
         // A second install in the same second keeps the first backup intact.
         install(home.path(), &exe(), 1_700_000_000).unwrap();
@@ -545,7 +599,94 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         fs::create_dir(home.path().join(".claude")).unwrap();
         fs::write(home.path().join(".claude/settings.json"), SHARED_GROUP).unwrap();
-        assert_eq!(installed(home.path()), vec![("claude".to_string(), false)]);
+        assert_eq!(installed(home.path(), &exe()), vec![("claude".to_string(), false)]);
+    }
+
+    fn appimage() -> PathBuf {
+        PathBuf::from("/home/u/Agent Pin_0.1.0_amd64.AppImage")
+    }
+
+    #[test]
+    fn appimage_reinstall_keeps_one_entry_per_event() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir(home.path().join(".claude")).unwrap();
+        fs::create_dir(home.path().join(".codex")).unwrap();
+        install(home.path(), &appimage(), 1).unwrap();
+        install(home.path(), &appimage(), 2).unwrap();
+        for provider in PROVIDERS {
+            let text = fs::read_to_string(home.path().join(provider.config_rel)).unwrap();
+            let config: Value = serde_json::from_str(&text).unwrap();
+            for event in provider.events {
+                let want = hook_command(&appimage(), provider.id, event);
+                let cmds = commands(&config, event);
+                assert_eq!(cmds, vec![want], "{} {event}", provider.id);
+            }
+        }
+        assert_eq!(
+            installed(home.path(), &appimage()),
+            vec![("claude".to_string(), true), ("codex".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn appimage_merge_keeps_user_hooks() {
+        let mut config: Value = serde_json::from_str(SHARED_GROUP).unwrap();
+        merge(&mut config, claude(), &appimage());
+        merge(&mut config, claude(), &appimage());
+        let cmds = commands(&config, "PreToolUse");
+        assert!(cmds.contains(&USER_CMD.to_string()), "{cmds:?}");
+        let want = hook_command(&appimage(), "claude", "PreToolUse");
+        assert_eq!(cmds.iter().filter(|c| **c == want).count(), 1, "{cmds:?}");
+    }
+
+    #[test]
+    fn moved_exe_is_not_installed() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir(home.path().join(".claude")).unwrap();
+        install(home.path(), &appimage(), 1).unwrap();
+        let moved = PathBuf::from("/home/u/Applications/Agent Pin_0.1.0_amd64.AppImage");
+        assert_eq!(installed(home.path(), &moved), vec![("claude".to_string(), false)]);
+        // Reinstalling from the new place replaces the old entries.
+        install(home.path(), &moved, 2).unwrap();
+        let text = fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
+        let config: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(commands(&config, "Stop"), vec![hook_command(&moved, "claude", "Stop")]);
+        assert_eq!(installed(home.path(), &moved), vec![("claude".to_string(), true)]);
+    }
+
+    #[test]
+    fn foreign_quoted_hook_command_is_kept() {
+        let mut config = serde_json::json!({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": "\"/opt/other tool\" hook claude Stop"}
+        ]}]}});
+        merge(&mut config, claude(), &appimage());
+        assert_eq!(
+            commands(&config, "Stop"),
+            vec![
+                "\"/opt/other tool\" hook claude Stop".to_string(),
+                hook_command(&appimage(), "claude", "Stop")
+            ]
+        );
+    }
+
+    #[test]
+    fn choose_exe_uses_appimage_only_inside_its_mount() {
+        let cur = PathBuf::from("/tmp/.mount_AgentPabc/usr/bin/agent-pin");
+        let img = Some(OsString::from("/home/u/Agent Pin.AppImage"));
+        let dir = Some(OsString::from("/tmp/.mount_AgentPabc"));
+        assert_eq!(choose_exe(cur.clone(), img.clone(), dir.clone()), PathBuf::from("/home/u/Agent Pin.AppImage"));
+        // APPIMAGE leaked from another AppImage (e.g. an editor's terminal).
+        let other_dir = Some(OsString::from("/tmp/.mount_Cursorxyz"));
+        let plain = PathBuf::from("/usr/bin/agent-pin");
+        assert_eq!(choose_exe(plain.clone(), img.clone(), other_dir), plain);
+        assert_eq!(choose_exe(plain.clone(), img.clone(), None), plain);
+        // A prefix that is not a path-component prefix does not count.
+        let near = PathBuf::from("/tmp/.mount_AgentPabcdef/usr/bin/agent-pin");
+        assert_eq!(choose_exe(near.clone(), img.clone(), dir.clone()), near);
+        // Empty or missing APPIMAGE.
+        assert_eq!(choose_exe(cur.clone(), Some(OsString::new()), dir.clone()), cur);
+        assert_eq!(choose_exe(cur.clone(), None, dir.clone()), cur);
+        assert_eq!(choose_exe(cur.clone(), img, Some(OsString::new())), cur);
     }
 
     #[cfg(unix)]

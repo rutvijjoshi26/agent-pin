@@ -43,7 +43,8 @@ fn mark_seen(key: String) -> Result<(), String> {
 #[tauri::command]
 fn read_integrations() -> Integrations {
     let providers = home_dir()
-        .map(|home| install::installed(&home))
+        .zip(hook_exe().ok())
+        .map(|(home, exe)| install::installed(&home, &exe))
         .unwrap_or_default()
         .into_iter()
         .map(|(id, installed)| ProviderIntegration { id, installed })
@@ -103,10 +104,7 @@ fn start_window_drag(window: WebviewWindow) -> Result<(), String> {
 /// `install-hooks` CLI subcommand.
 pub fn install_hooks() -> Result<Vec<String>, String> {
     let home = home_dir().ok_or(NO_HOME)?;
-    let exe = match appimage_path() {
-        Some(path) => path,
-        None => std::env::current_exe().map_err(|error| error.to_string())?,
-    };
+    let exe = hook_exe()?;
     validate_install_exe_path(&exe)?;
     install::install(&home, &exe, now_ms() / 1000)
 }
@@ -127,15 +125,19 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// On Linux, the AppImage file itself (`APPIMAGE`), since `current_exe` is a
-/// temporary mount that vanishes when the app quits.
-fn appimage_path() -> Option<PathBuf> {
+/// The exe the installed hook commands run. On Linux inside an AppImage this
+/// is the AppImage file itself, since `current_exe` is a temporary mount that
+/// vanishes when the app quits; see [`install::choose_exe`].
+fn hook_exe() -> Result<PathBuf, String> {
+    let current = std::env::current_exe().map_err(|error| error.to_string())?;
     if !cfg!(target_os = "linux") {
-        return None;
+        return Ok(current);
     }
-    std::env::var_os("APPIMAGE")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
+    Ok(install::choose_exe(
+        current,
+        std::env::var_os("APPIMAGE"),
+        std::env::var_os("APPDIR"),
+    ))
 }
 
 /// True on Linux under a Wayland session, where always-on-top may be ignored.
