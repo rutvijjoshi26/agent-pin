@@ -3,7 +3,7 @@
 // overlay; the tradeoff is that CLI subcommands print nothing there. Hook mode
 // still works: the agent passes stdin as an inherited pipe.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -81,11 +81,14 @@ fn hook(args: &[String]) -> ! {
                 agent_pin_lib::now_ms(),
             )
         });
-        match result {
-            Ok(Err(error)) => eprintln!("agent-pin: {error}"),
-            Err(_) => eprintln!("agent-pin: hook panicked"),
-            Ok(Ok(())) => {}
-        }
+        // `eprintln!` panics when stderr is closed; a failed write is ignored
+        // so the hook still exits 0.
+        let mut stderr = std::io::stderr();
+        let _ = match result {
+            Ok(Err(error)) => writeln!(stderr, "agent-pin: {error}"),
+            Err(_) => writeln!(stderr, "agent-pin: hook panicked"),
+            Ok(Ok(())) => Ok(()),
+        };
     }
     // Exit explicitly so a reader thread stuck on stdin can't keep us alive.
     std::process::exit(0);

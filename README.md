@@ -52,6 +52,8 @@ agent-pin install-hooks                 # install or update hooks for Claude Cod
 agent-pin reset                         # clear all stored session state
 ```
 
+The `agent-pin` CLI binary isn't on your `PATH` by default (the `.deb`, which installs `/usr/bin/agent-pin`, is the exception). It lives inside the app: `Agent Pin.app/Contents/MacOS/agent-pin` on macOS, the `.AppImage` file itself on Linux (for example `./Agent\ Pin_<version>_<arch>.AppImage install-hooks`), and `agent-pin.exe` in the install folder on Windows. Run it by full path or symlink it onto your `PATH`.
+
 On Windows, release builds have no console window, so the CLI prints nothing there. Use the **Set up** button instead of `install-hooks`.
 
 ## How it works
@@ -69,7 +71,7 @@ agent-pin hook <provider> <EventName>
 Agent Pin overlay
 ```
 
-Each hook event updates one small JSON file per session under `~/.agent-pin/sessions/`. Set `AGENT_PIN_HOME` to use a different directory.
+Each hook event updates one small JSON file per session under `~/.agent-pin/sessions/`. Set `AGENT_PIN_HOME` to use a different directory. While running, the app deletes session files that haven't changed in 3 days.
 
 The hook can never block an agent. Claude Code hooks are installed with `"async": true`, and `agent-pin hook` always exits 0: it waits at most about 2 seconds for its input, and reports any error only on stderr. Codex hooks are installed without `async`.
 
@@ -98,7 +100,7 @@ You need **Node.js 18+** and the **Rust toolchain** ([rustup](https://rustup.rs/
 cargo test --manifest-path crates/agent-pin-core/Cargo.toml
 
 # Frontend tests
-node --test apps/desktop/web/
+node --test apps/desktop/web/*.test.js
 
 # The app
 cd apps/desktop && npm ci && npm run build
