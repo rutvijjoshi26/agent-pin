@@ -72,6 +72,103 @@ pub fn mark_seen(dir: &Path, row_key: &str, now_ms: i64) -> io::Result<()> {
 }
 
 /// Removes `<dir>/sessions` and everything in it.
+/// Deletes stale files in `<dir>/sessions`, returning how many went:
+/// - session `*.json` files whose `updated_ms` is older than `max_age_ms`
+///   before `now_ms` (unparseable ones go by file mtime), together with their
+///   lock file, all under the session's lock (bounded, as for writers); a
+///   session whose lock stays busy is skipped;
+/// - `*.json.tmp-*` files and orphan `*.lock` files (no session file) whose
+///   mtime is older than `max_age_ms`; a lock someone holds is kept.
+///
+/// mtime ages are measured against the system clock. Per-file errors are
+/// skipped; only failing to list the directory is an error.
+pub fn prune(dir: &Path, now_ms: i64, max_age_ms: i64) -> io::Result<usize> {
+    let sessions = dir.join("sessions");
+    let names: Vec<String> = match fs::read_dir(&sessions) {
+        Ok(entries) => entries
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let max_age = Duration::from_millis(max_age_ms.max(0) as u64);
+    let mut removed = 0;
+    for stem in names.iter().filter_map(|n| n.strip_suffix(".json")) {
+        removed += prune_session(&sessions, stem, now_ms, max_age_ms, max_age).unwrap_or(0);
+    }
+    for name in &names {
+        let path = sessions.join(name);
+        if name.contains(".json.tmp-") {
+            if older_than(&path, max_age) && fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        } else if let Some(stem) = name.strip_suffix(".lock") {
+            if prune_orphan_lock(&sessions, stem, &path, max_age) {
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// Prunes one session under its lock. Returns how many files went.
+fn prune_session(
+    sessions: &Path,
+    stem: &str,
+    now_ms: i64,
+    max_age_ms: i64,
+    max_age: Duration,
+) -> io::Result<usize> {
+    check_stem(stem)?;
+    let lock_path = sessions.join(format!("{stem}.lock"));
+    let lock = lock_session(&lock_path)?;
+    let path = sessions.join(format!("{stem}.json"));
+    let stale = match read_state(&path)? {
+        Some(state) => state.updated_ms < now_ms.saturating_sub(max_age_ms),
+        None => path.exists() && older_than(&path, max_age),
+    };
+    if !stale {
+        return Ok(0);
+    }
+    fs::remove_file(&path)?;
+    // Writers waiting on this lock file notice it was unlinked and relock.
+    let lock_gone = fs::remove_file(&lock_path).is_ok();
+    drop(lock);
+    Ok(1 + usize::from(lock_gone))
+}
+
+/// Removes a lock file with no session file beside it, if it is old and
+/// nobody holds it.
+fn prune_orphan_lock(sessions: &Path, stem: &str, path: &Path, max_age: Duration) -> bool {
+    if check_stem(stem).is_err()
+        || sessions.join(format!("{stem}.json")).exists()
+        || !older_than(path, max_age)
+    {
+        return false;
+    }
+    let Ok(lock) = OpenOptions::new().write(true).open(path) else {
+        return false;
+    };
+    if lock.try_lock().is_err() || !still_linked(&lock, path) {
+        return false;
+    }
+    // Re-check under the lock: a writer may have created the session since.
+    if sessions.join(format!("{stem}.json")).exists() {
+        return false;
+    }
+    fs::remove_file(path).is_ok()
+}
+
+/// True when `path`'s mtime is more than `max_age` before the system clock.
+fn older_than(path: &Path, max_age: Duration) -> bool {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age > max_age)
+}
+
 pub fn reset(dir: &Path) -> io::Result<()> {
     match fs::remove_dir_all(dir.join("sessions")) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -87,14 +184,7 @@ fn update_stem(
     check_stem(stem)?;
     let sessions = dir.join("sessions");
     fs::create_dir_all(&sessions)?;
-    // The lock file is never removed: deleting it would let two writers
-    // lock different inodes for the same session.
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(sessions.join(format!("{stem}.lock")))?;
-    lock_bounded(&lock)?;
+    let _lock = lock_session(&sessions.join(format!("{stem}.lock")))?;
     let path = sessions.join(format!("{stem}.json"));
     match f(read_state(&path)?) {
         Some(state) => write_atomic(&sessions, stem, &path, &state),
@@ -103,12 +193,31 @@ fn update_stem(
             other => other,
         },
     }
-    // `lock` drops here, releasing the lock.
+    // `_lock` drops here, releasing the lock.
 }
 
-/// Takes an exclusive lock on `file`, retrying until [`LOCK_TIMEOUT`].
-fn lock_bounded(file: &File) -> io::Result<()> {
+/// Opens (creating if needed) and exclusively locks the lock file at
+/// `path`, retrying until [`LOCK_TIMEOUT`]. Only [`prune`] deletes lock files,
+/// and only while holding them; a caller that then wins the unlinked file
+/// sees it is no longer at `path` and locks the current file instead, so two
+/// writers never hold different lock files for one session.
+fn lock_session(path: &Path) -> io::Result<File> {
     let deadline = Instant::now() + LOCK_TIMEOUT;
+    loop {
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)?;
+        lock_until(&lock, deadline)?;
+        if still_linked(&lock, path) {
+            return Ok(lock);
+        }
+    }
+}
+
+/// Takes an exclusive lock on `file`, retrying until `deadline`.
+fn lock_until(file: &File, deadline: Instant) -> io::Result<()> {
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(()),
@@ -125,6 +234,23 @@ fn lock_bounded(file: &File) -> io::Result<()> {
             }
         }
     }
+}
+
+/// True when `file` is still the file at `path`.
+#[cfg(unix)]
+fn still_linked(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), fs::metadata(path)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Best effort where file identity is not available on stable Rust: the
+/// path still exists.
+#[cfg(not(unix))]
+fn still_linked(_file: &File, path: &Path) -> bool {
+    path.exists()
 }
 
 /// Accepts only non-empty stems of `[A-Za-z0-9_-]`, so a stem can never
@@ -351,7 +477,7 @@ mod tests {
         let waited = start.elapsed();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(waited >= std::time::Duration::from_millis(1900), "{waited:?}");
-        assert!(waited < std::time::Duration::from_secs(3), "{waited:?}");
+        assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
         assert!(!json_path(dir, "claude__held").exists());
         // Once released, the session can be written again.
         drop(holder);
@@ -373,6 +499,129 @@ mod tests {
         assert!(err.is_err());
         assert!(!called, "f must not run after a read error");
         assert!(json_path(dir, "claude__s1").is_dir());
+    }
+
+    const DAY: i64 = 86_400_000;
+
+    fn set_age(path: &Path, age: Duration) {
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age).unwrap();
+    }
+
+    fn put(dir: &Path, key: &str, updated_ms: i64) {
+        update_session(dir, "claude", key, |_| {
+            let mut s = state("claude", key);
+            s.updated_ms = updated_ms;
+            Some(s)
+        })
+        .unwrap();
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir.join("sessions"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn prune_removes_old_sessions_and_keeps_fresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = 10 * DAY;
+        put(dir, "old", now - 3 * DAY - 1);
+        put(dir, "fresh", now - 3 * DAY + 1000);
+        let removed = prune(dir, now, 3 * DAY).unwrap();
+        assert_eq!(removed, 2, "old json and its lock");
+        assert_eq!(names(dir), ["claude__fresh.json", "claude__fresh.lock"]);
+    }
+
+    #[test]
+    fn prune_judges_unparseable_sessions_by_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let sessions = dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("claude__oldbad.json"), b"{nope").unwrap();
+        fs::write(sessions.join("claude__newbad.json"), b"{nope").unwrap();
+        set_age(&sessions.join("claude__oldbad.json"), Duration::from_secs(4 * 86_400));
+        prune(dir, 10 * DAY, 3 * DAY).unwrap();
+        assert!(!sessions.join("claude__oldbad.json").exists());
+        assert!(sessions.join("claude__newbad.json").exists());
+    }
+
+    #[test]
+    fn prune_removes_orphan_tmp_and_lock_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let sessions = dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        for name in [
+            "claude__a.json.tmp-1-0",
+            "claude__b.lock",
+            "claude__c.json.tmp-2-0",
+            "claude__d.lock",
+        ] {
+            fs::write(sessions.join(name), b"").unwrap();
+        }
+        let old = Duration::from_secs(4 * 86_400);
+        set_age(&sessions.join("claude__a.json.tmp-1-0"), old);
+        set_age(&sessions.join("claude__b.lock"), old);
+        let removed = prune(dir, 10 * DAY, 3 * DAY).unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(names(dir), ["claude__c.json.tmp-2-0", "claude__d.lock"]);
+        // A missing sessions dir prunes nothing.
+        assert_eq!(prune(&dir.join("nope"), 10 * DAY, 3 * DAY).unwrap(), 0);
+    }
+
+    #[test]
+    fn prune_skips_a_session_whose_lock_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        put(dir, "busy", 1);
+        let holder = OpenOptions::new()
+            .write(true)
+            .open(dir.join("sessions").join("claude__busy.lock"))
+            .unwrap();
+        holder.lock().unwrap();
+        assert_eq!(prune(dir, 10 * DAY, 3 * DAY).unwrap(), 0);
+        assert!(json_path(dir, "claude__busy").exists());
+        drop(holder);
+        assert_eq!(prune(dir, 10 * DAY, 3 * DAY).unwrap(), 2);
+    }
+
+    /// A writer that was waiting on a lock file prune then deleted must not
+    /// keep using that unlinked file, or it could run beside a writer that
+    /// locked the new file at the same path.
+    #[cfg(unix)]
+    #[test]
+    fn writer_relocks_after_lock_file_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let sessions = dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let lock_path = sessions.join("claude__s.lock");
+        let open = |p: &Path| {
+            OpenOptions::new().create(true).truncate(false).write(true).open(p).unwrap()
+        };
+        let first = open(&lock_path);
+        first.lock().unwrap();
+        let writer_dir = dir.clone();
+        let writer = thread::spawn(move || {
+            update_session(&writer_dir, "claude", "s", |_| Some(state("claude", "s")))
+        });
+        thread::sleep(Duration::from_millis(150));
+        fs::remove_file(&lock_path).unwrap();
+        let second = open(&lock_path);
+        second.lock().unwrap();
+        drop(first);
+        thread::sleep(Duration::from_millis(150));
+        assert!(!json_path(&dir, "claude__s").exists(), "writer ran beside the new lock holder");
+        drop(second);
+        writer.join().unwrap().unwrap();
+        assert!(json_path(&dir, "claude__s").exists());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Thin Tauri shell over `agent-pin-core`: window placement plus the
 //! commands the overlay calls. All status logic lives in the core crate.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,6 +11,11 @@ use serde::Serialize;
 use tauri::{LogicalSize, Manager, PhysicalPosition, Position, Size, WebviewWindow};
 
 const SCREEN_MARGIN: f64 = 20.0;
+
+/// Session files untouched for this long (3 days) are deleted.
+const PRUNE_AFTER_MS: i64 = 259_200_000;
+/// How often the app prunes session files after the one at start.
+const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 const NO_STATE_DIR: &str = "no state directory: set AGENT_PIN_HOME or the home directory";
 const NO_HOME: &str = "Could not resolve home directory";
@@ -171,6 +177,7 @@ pub fn run() {
             start_window_drag
         ])
         .setup(|app| {
+            spawn_pruner();
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_always_on_top(true);
                 let _ = position_top_right(&window);
@@ -179,6 +186,19 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running Agent Pin");
+}
+
+/// Prunes stale session files now and then every hour, on a background
+/// thread so a busy session lock never stalls the UI.
+fn spawn_pruner() {
+    std::thread::spawn(|| loop {
+        if let Some(dir) = store::state_dir() {
+            if let Err(error) = store::prune(&dir, now_ms(), PRUNE_AFTER_MS) {
+                let _ = writeln!(std::io::stderr(), "agent-pin: prune {}: {error}", dir.display());
+            }
+        }
+        std::thread::sleep(PRUNE_EVERY);
+    });
 }
 
 /// Places the window in the top-right corner of its monitor, `SCREEN_MARGIN`
