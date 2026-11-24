@@ -88,3 +88,20 @@ function basename(path) {
   const parts = String(path).split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] || String(path);
 }
+
+/** Longest a pointer press may hold back row rebuilds. */
+export const HOLD_MAX_MS = 1500;
+
+/**
+ * When a press starts holding rebuilds: only presses on interactive targets
+ * (rows, cards, buttons) hold, so a press that starts a native window drag,
+ * whose pointerup the OS may swallow, never does. Returns the start time or null.
+ */
+export function pressHold(interactive, nowMs) {
+  return interactive ? nowMs : null;
+}
+
+/** True while a hold that started at `holdSince` is still in force. */
+export function isHeld(holdSince, nowMs) {
+  return holdSince !== null && nowMs - holdSince < HOLD_MAX_MS;
+}

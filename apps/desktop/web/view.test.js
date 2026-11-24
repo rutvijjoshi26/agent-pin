@@ -1,7 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { ageText, cardCatchUp, catchUpLines, collisionText, statusMeta } from "./view.js";
+import {
+  HOLD_MAX_MS,
+  ageText,
+  cardCatchUp,
+  catchUpLines,
+  collisionText,
+  isHeld,
+  pressHold,
+  statusMeta
+} from "./view.js";
 
 const NOW = 10_000_000_000;
 
@@ -143,4 +152,20 @@ test("cardCatchUp without a snapshot is the live catch-up", () => {
     unseen: true
   };
   assert.deepEqual(cardCatchUp(live, undefined), live);
+});
+
+test("a non-interactive press never holds renders", () => {
+  assert.equal(pressHold(false, NOW), null);
+  assert.equal(isHeld(pressHold(false, NOW), NOW), false);
+  assert.equal(isHeld(null, NOW), false);
+});
+
+test("an interactive press holds renders until it expires after 1.5 s", () => {
+  assert.equal(HOLD_MAX_MS, 1500);
+  const since = pressHold(true, NOW);
+  assert.equal(since, NOW);
+  assert.equal(isHeld(since, NOW), true);
+  assert.equal(isHeld(since, NOW + 1499), true);
+  assert.equal(isHeld(since, NOW + 1500), false);
+  assert.equal(isHeld(since, NOW + 60_000), false);
 });

@@ -1,6 +1,15 @@
 // DOM glue for the overlay. Display logic lives in view.js; all text from
 // rows is untrusted (prompts, commands, paths) and is set via textContent.
-import { ageText, cardCatchUp, catchUpLines, collisionText, statusMeta } from "./view.js";
+import {
+  HOLD_MAX_MS,
+  ageText,
+  cardCatchUp,
+  catchUpLines,
+  collisionText,
+  isHeld,
+  pressHold,
+  statusMeta
+} from "./view.js";
 
 const POLL_MS = 800;
 const INSTALLED_MESSAGE = "Run /hooks in Claude Code to review and trust the new hooks";
@@ -22,7 +31,9 @@ let renderedSignature = "";
 // Open cards, keyed by row key, mapped to the row's catch_up as it was just
 // before mark_seen emptied the backend's since-seen lists.
 const openCards = new Map();
-let pointerDown = false;
+// Start time of a press that holds row rebuilds (see pressHold), or null.
+let holdSince = null;
+let holdTimer = null;
 let renderPending = false;
 let integrations = null;
 let setupMessage = "";
@@ -30,11 +41,21 @@ let installing = false;
 let fittedSize = "";
 
 // Drag from the pin background only; rows, cards and buttons handle clicks.
+// A press on those holds row rebuilds, so a poll can't replace the element
+// under the pointer and swallow the click. A press that starts a native drag
+// never holds: the OS drag loop may swallow its pointerup.
 pin.addEventListener("pointerdown", (event) => {
-  if (event.button !== 0 || event.detail > 1) {
+  if (event.button !== 0) {
     return;
   }
-  if (isInteractive(event.target)) {
+  holdSince = pressHold(isInteractive(event.target), Date.now());
+  if (holdSince !== null) {
+    clearTimeout(holdTimer);
+    holdTimer = setTimeout(releaseHold, HOLD_MAX_MS);
+    return;
+  }
+  releaseHold();
+  if (event.detail > 1) {
     return;
   }
   invoke("start_window_drag").catch((error) => console.warn("Unable to start window drag", error));
@@ -67,19 +88,17 @@ agents.addEventListener("click", (event) => {
   renderRows(true);
 });
 
-// Hold rebuilds while a button is down on the rows, so a poll can't replace
-// the element under the pointer and swallow the click. The held rebuild runs
-// after the click has been dispatched.
-agents.addEventListener("pointerdown", () => {
-  pointerDown = true;
-});
 for (const type of ["pointerup", "pointercancel", "blur"]) {
-  window.addEventListener(type, () => {
-    pointerDown = false;
-    if (renderPending) {
-      setTimeout(() => renderRows(true), 0);
-    }
-  });
+  window.addEventListener(type, releaseHold);
+}
+
+// Ends a hold; a held rebuild runs after the click has been dispatched.
+function releaseHold() {
+  holdSince = null;
+  clearTimeout(holdTimer);
+  if (renderPending) {
+    setTimeout(() => renderRows(true), 0);
+  }
 }
 
 setupButton.addEventListener("click", async () => {
@@ -132,7 +151,7 @@ async function refresh() {
 }
 
 function renderRows(force) {
-  if (pointerDown) {
+  if (isHeld(holdSince, Date.now())) {
     renderPending = true;
     return;
   }
