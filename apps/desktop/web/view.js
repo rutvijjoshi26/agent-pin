@@ -328,3 +328,37 @@ function capitalize(id) {
   const text = String(id);
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
+
+/** A decide click is ignored for this long after the layout last moved. */
+export const CLICK_GUARD_MS = 500;
+
+/**
+ * Tracks when each shown request first appeared and when the approvals set
+ * or row order last changed, so a click aimed at one button cannot land on a
+ * different Allow that slid under the pointer. `previous` is the last
+ * tracker (or null); `shownIds` are the request ids on screen and `rowKeys`
+ * the rows in order. Returns a new tracker; the input is not mutated.
+ */
+export function trackLayout(previous, shownIds, rowKeys, nowMs) {
+  const signature = JSON.stringify([[...shownIds].sort(), rowKeys]);
+  const firstSeen = new Map();
+  for (const id of shownIds) {
+    firstSeen.set(id, previous && previous.firstSeen.has(id) ? previous.firstSeen.get(id) : nowMs);
+  }
+  const changedMs = previous && previous.signature === signature ? previous.changedMs : nowMs;
+  return { firstSeen, signature, changedMs };
+}
+
+/**
+ * Whether a click on a decide button for request `id` is accepted: not if
+ * that request first rendered, or the layout last changed, less than
+ * CLICK_GUARD_MS ago, and not if it is not shown at all.
+ */
+export function decideAccepted(tracker, id, nowMs) {
+  if (!tracker || !tracker.firstSeen.has(id)) {
+    return false;
+  }
+  return (
+    nowMs - tracker.firstSeen.get(id) >= CLICK_GUARD_MS && nowMs - tracker.changedMs >= CLICK_GUARD_MS
+  );
+}

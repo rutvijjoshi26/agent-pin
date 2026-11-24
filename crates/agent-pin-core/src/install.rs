@@ -50,11 +50,18 @@ pub const PROVIDERS: &[Provider] = &[
     },
 ];
 
-/// The shell command installed for one hook: `"<exe>" hook <provider> <event>`.
+/// The marker argument that makes a PermissionRequest hook post to the app
+/// and wait for a click. Without it the hook returns at once, so an install
+/// from before approvals (same exe, async entry) never waits for nothing.
+pub const WAIT_MARKER: &str = "--wait";
+
+/// The shell command installed for one hook: `"<exe>" hook <provider> <event>`,
+/// plus ` --wait` ([`WAIT_MARKER`]) for PermissionRequest.
 /// The exe is wrapped in double quotes with inner `"` escaped; backslashes are
 /// left alone so Windows paths stay valid.
 pub fn hook_command(exe: &Path, provider: &str, event: &str) -> String {
-    format!("{}{provider} {event}", exe_prefix(exe))
+    let marker = if event == "PermissionRequest" { format!(" {WAIT_MARKER}") } else { String::new() };
+    format!("{}{provider} {event}{marker}", exe_prefix(exe))
 }
 
 /// True for commands agent-pin installed: the legacy Ruby `agent-pin-status`
@@ -77,13 +84,19 @@ pub fn is_agent_pin_command(cmd: &str) -> bool {
 }
 
 /// The exe of a command shaped exactly like [`hook_command`] output:
-/// `"<exe>" hook <provider> <event>` with nothing after the event.
+/// `"<exe>" hook <provider> <event>` with at most the [`WAIT_MARKER`] after
+/// the event.
 fn quoted_hook_exe(cmd: &str) -> Option<&str> {
     let rest = cmd.strip_prefix('"')?;
     let end = rest.find("\" hook ")?;
     let args: Vec<&str> = rest[end + "\" hook ".len()..].split(' ').collect();
     let word = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-    (args.len() == 2 && args.iter().all(|w| word(w))).then_some(&rest[..end])
+    let shaped = match args.len() {
+        2 => true,
+        3 => args[2] == WAIT_MARKER,
+        _ => false,
+    };
+    (shaped && args.iter().all(|w| word(w))).then_some(&rest[..end])
 }
 
 /// True for an entry agent-pin owns: [`is_agent_pin_command`], or a hook
@@ -575,7 +588,7 @@ mod tests {
     /// An install from before approvals: Claude's PermissionRequest entry is
     /// async and has no timeout, beside a user's own hook.
     fn old_async_install() -> Value {
-        let cmd = hook_command(&exe(), "claude", "PermissionRequest");
+        let cmd = format!("{}claude PermissionRequest", exe_prefix(&exe()));
         let mut config: Value = serde_json::from_str(SHARED_GROUP).unwrap();
         merge(&mut config, claude(), &exe());
         config["hooks"]["PermissionRequest"] = serde_json::json!([
@@ -917,6 +930,27 @@ mod tests {
         let home = claude_home(Some(&text));
         assert_eq!(status(home.path(), &exe()), vec![("claude".to_string(), HookStatus::Stale)]);
         assert_eq!(installed(home.path(), &exe()), vec![("claude".to_string(), false)]);
+    }
+
+    /// Timeout 600 and sync, but no `--wait` marker (the command an upgraded
+    /// binary would otherwise run as a waiting hook): Stale for both providers.
+    #[test]
+    fn status_stale_for_permission_entry_without_marker() {
+        for (provider, dir, file) in [("claude", ".claude", "settings.json"), ("codex", ".codex", "hooks.json")] {
+            let mut config = Value::Null;
+            let p = PROVIDERS.iter().find(|p| p.id == provider).unwrap();
+            merge(&mut config, p, &exe());
+            let want = hook_command(&exe(), provider, "PermissionRequest");
+            assert!(want.ends_with(" --wait"), "{want}");
+            let old = want.trim_end_matches(" --wait").to_string();
+            config["hooks"]["PermissionRequest"][0]["hooks"][0]["command"] = old.into();
+            let home = tempfile::tempdir().unwrap();
+            fs::create_dir(home.path().join(dir)).unwrap();
+            fs::write(home.path().join(dir).join(file), serde_json::to_string_pretty(&config).unwrap()).unwrap();
+            assert_eq!(status(home.path(), &exe()), vec![(provider.to_string(), HookStatus::Stale)], "{provider}");
+            install(home.path(), &exe(), 1).unwrap();
+            assert_eq!(status(home.path(), &exe()), vec![(provider.to_string(), HookStatus::Current)]);
+        }
     }
 
     #[test]

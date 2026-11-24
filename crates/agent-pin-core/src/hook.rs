@@ -17,7 +17,13 @@ use crate::store::update_session;
 /// its `session_id` and `cwd` are salvaged from the first `STDIN_MAX` bytes.
 pub const STDIN_MAX: u64 = 1 << 20;
 
-/// Runs one hook event. `args` is `[provider, event_name]`; `stdin` is the
+/// Tools whose permission decision needs `updatedInput` alongside an allow
+/// (Claude Code hooks docs); a plain allow would be wrong, so they are never
+/// posted and the terminal prompt stays.
+const NO_APPROVAL_TOOLS: [&str; 2] = ["AskUserQuestion", "ExitPlanMode"];
+
+/// Runs one hook event. `args` is `[provider, event_name]` (a third
+/// `--wait` marks an installed approvals-aware PermissionRequest hook); `stdin` is the
 /// hook's JSON payload. A payload that is not a complete JSON object (empty,
 /// truncated, garbage, or over 1 MB) keeps only `session_id` and `cwd`
 /// salvaged from its raw bytes so the status still moves; without a
@@ -25,7 +31,8 @@ pub const STDIN_MAX: u64 = 1 << 20;
 /// is used only for a valid JSON object with no `session_id`. The caller bounds how
 /// long reading `stdin` can take. Errors are returned, never panicked.
 ///
-/// A PermissionRequest whose payload parsed as JSON and names a tool (a
+/// A PermissionRequest with the `--wait` marker whose payload parsed as JSON
+/// and names a tool other than AskUserQuestion/ExitPlanMode (a
 /// salvaged payload never names one) is, after its state is recorded and
 /// the session lock released, posted to the app when approvals are on and
 /// the app is alive. The hook then waits for the user's click and returns
@@ -82,8 +89,9 @@ pub fn run_hook(
     // The session lock is released: waiting here blocks no other hook.
     // Input reaching this point parsed as JSON or had a session_id salvaged;
     // a salvaged one carries no tool name, so it never waits.
-    let has_tool = input.tool_name.as_deref().is_some_and(|t| !t.trim().is_empty());
-    if kind != HookKind::PermissionRequest || !has_tool {
+    let tool = input.tool_name.as_deref().map(str::trim).unwrap_or("");
+    let waits = args.get(2).is_some_and(|a| a == crate::install::WAIT_MARKER);
+    if kind != HookKind::PermissionRequest || tool.is_empty() || !waits || NO_APPROVAL_TOOLS.contains(&tool) {
         return Ok(None);
     }
     let t = unix_ms();
@@ -386,12 +394,56 @@ mod tests {
         (stop, handle)
     }
 
+    fn wait_args(provider: &str) -> Vec<String> {
+        vec![provider.to_owned(), "PermissionRequest".to_owned(), "--wait".to_owned()]
+    }
+
+    /// An install from before approvals runs the hook without the marker:
+    /// even with a live app it records state, posts nothing, prints nothing.
+    #[test]
+    fn permission_request_without_marker_never_posts() {
+        for provider in ["claude", "codex"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().to_path_buf();
+            let (stop, app) = fake_app(&dir, Some(Behavior::Allow), |_| {});
+            let start = Instant::now();
+            let out = run_hook(&args(provider, "PermissionRequest"), PERMISSION, Some(dir.clone()), 1);
+            std::thread::sleep(Duration::from_millis(3 * approvals::POLL_MS));
+            stop.store(true, Ordering::SeqCst);
+            assert!(app.join().unwrap().is_empty(), "no request posted");
+            assert_eq!(out, Ok(None));
+            assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+            assert!(!dir.join("approvals").exists(), "no request file");
+            assert_eq!(list_sessions(&dir)[0].status, Status::WaitingApproval);
+        }
+    }
+
+    /// AskUserQuestion and ExitPlanMode need `updatedInput` with an allow, so
+    /// a plain decision would be wrong: they never post.
+    #[test]
+    fn question_and_plan_tools_never_post() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (stop, app) = fake_app(&dir, Some(Behavior::Allow), |_| {});
+        for tool in ["AskUserQuestion", "ExitPlanMode"] {
+            let input = format!(r#"{{"session_id":"s1","tool_name":"{tool}","tool_input":{{"plan":"x"}}}}"#);
+            let start = Instant::now();
+            let out = run_hook(&wait_args("claude"), input.as_bytes(), Some(dir.clone()), 1);
+            assert_eq!(out, Ok(None), "{tool}");
+            assert!(start.elapsed() < Duration::from_secs(1), "{tool}");
+        }
+        std::thread::sleep(Duration::from_millis(3 * approvals::POLL_MS));
+        stop.store(true, Ordering::SeqCst);
+        assert!(app.join().unwrap().is_empty(), "no request posted");
+        assert_eq!(list_sessions(&dir)[0].status, Status::WaitingApproval);
+    }
+
     #[test]
     fn permission_request_without_app_returns_none_fast() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         let start = Instant::now();
-        let out = run_hook(&args("claude", "PermissionRequest"), PERMISSION, Some(dir.clone()), 1);
+        let out = run_hook(&wait_args("claude"), PERMISSION, Some(dir.clone()), 1);
         assert_eq!(out, Ok(None));
         assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
         assert_eq!(list_sessions(&dir)[0].status, Status::WaitingApproval);
@@ -399,7 +451,7 @@ mod tests {
         // A stale app.alive (app gone) is the same as none.
         approvals::write_alive(&dir, unix_ms() - 60_000).unwrap();
         let start = Instant::now();
-        let out = run_hook(&args("claude", "PermissionRequest"), PERMISSION, Some(dir.clone()), 2);
+        let out = run_hook(&wait_args("claude"), PERMISSION, Some(dir.clone()), 2);
         assert_eq!(out, Ok(None));
         assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
         assert!(!dir.join("approvals").exists(), "no request posted");
@@ -417,7 +469,7 @@ mod tests {
                 assert_eq!(s[0].status, Status::WaitingApproval);
             });
             let start = Instant::now();
-            let out = run_hook(&args(provider, "PermissionRequest"), PERMISSION, Some(dir.clone()), 1);
+            let out = run_hook(&wait_args(provider), PERMISSION, Some(dir.clone()), 1);
             stop.store(true, Ordering::SeqCst);
             let seen = app.join().unwrap();
             assert_eq!(out, Ok(Some(decision_json(b))), "{provider}");
@@ -447,7 +499,7 @@ mod tests {
             update_session(&other, "claude", "s1", |prev| prev).unwrap();
             assert!(start.elapsed() < Duration::from_millis(500), "{:?}", start.elapsed());
         });
-        let out = run_hook(&args("claude", "PermissionRequest"), PERMISSION, Some(dir.clone()), 1);
+        let out = run_hook(&wait_args("claude"), PERMISSION, Some(dir.clone()), 1);
         stop.store(true, Ordering::SeqCst);
         assert_eq!(app.join().unwrap().len(), 1);
         assert_eq!(out, Ok(Some(decision_json(Behavior::Allow))));
@@ -460,7 +512,7 @@ mod tests {
         approvals::set_enabled(&dir, false).unwrap();
         let (stop, app) = fake_app(&dir, Some(Behavior::Allow), |_| {});
         let start = Instant::now();
-        let out = run_hook(&args("claude", "PermissionRequest"), PERMISSION, Some(dir.clone()), 1);
+        let out = run_hook(&wait_args("claude"), PERMISSION, Some(dir.clone()), 1);
         let elapsed = start.elapsed();
         std::thread::sleep(Duration::from_millis(3 * approvals::POLL_MS));
         stop.store(true, Ordering::SeqCst);
@@ -507,7 +559,7 @@ mod tests {
         ];
         for input in inputs {
             let start = Instant::now();
-            let out = run_hook(&args("claude", "PermissionRequest"), input, Some(dir.clone()), 1);
+            let out = run_hook(&wait_args("claude"), input, Some(dir.clone()), 1);
             assert_eq!(out, Ok(None), "{:?}", String::from_utf8_lossy(&input[..input.len().min(80)]));
             assert!(start.elapsed() < Duration::from_secs(1));
         }
@@ -538,7 +590,7 @@ mod tests {
         fs::remove_dir_all(dir.join("approvals")).unwrap();
         fs::write(dir.join("approvals"), b"not a dir").unwrap();
         let start = Instant::now();
-        let out = run_hook(&args("claude", "PermissionRequest"), PERMISSION, Some(dir.clone()), 1);
+        let out = run_hook(&wait_args("claude"), PERMISSION, Some(dir.clone()), 1);
         assert_eq!(out, Ok(None));
         assert!(start.elapsed() < Duration::from_secs(1));
     }
@@ -553,14 +605,14 @@ mod tests {
             (String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
         };
         // No app: nothing printed.
-        assert_eq!(run_cli(&args("claude", "PermissionRequest"), PERMISSION), (String::new(), String::new()));
+        assert_eq!(run_cli(&wait_args("claude"), PERMISSION), (String::new(), String::new()));
         // An error goes to stderr only.
         let (out, err) = run_cli(&[], PERMISSION);
         assert_eq!(out, "");
         assert!(err.starts_with("agent-pin: usage"), "{err}");
         // A clicked decision: the JSON and a newline.
         let (stop, app) = fake_app(&dir, Some(Behavior::Deny), |_| {});
-        let (out, err) = run_cli(&args("claude", "PermissionRequest"), PERMISSION);
+        let (out, err) = run_cli(&wait_args("claude"), PERMISSION);
         let (out2, _) = run_cli(&args("claude", "PostToolUse"), PERMISSION);
         stop.store(true, Ordering::SeqCst);
         app.join().unwrap();

@@ -6,6 +6,8 @@ import {
   approvalButtonLabel,
   approvalChoices,
   approvalLines,
+  decideAccepted,
+  trackLayout,
   cardCatchUp,
   catchUpLines,
   collisionText,
@@ -43,6 +45,9 @@ let rows = [];
 let rowsError = null;
 // Pending approval requests from the last poll (see read_approvals).
 let approvals = [];
+// When each shown request first appeared and the layout last moved; see
+// decideAccepted.
+let layout = null;
 // Clicked Allow/Deny decisions by request id (see view.js decisionStarted).
 let decisions = new Map();
 let renderedSignature = "";
@@ -126,6 +131,11 @@ agents.addEventListener("click", (event) => {
 function decideFrom(button) {
   const id = button.dataset.id;
   if (!id || decisions.has(id)) {
+    return;
+  }
+  // A click right after the layout moved may have been aimed at another
+  // button: ignore it and leave the buttons enabled.
+  if (!decideAccepted(layout, id, Date.now())) {
     return;
   }
   const allow = button.dataset.decide === "allow";
@@ -256,6 +266,13 @@ function renderRows(force) {
       openCards.delete(key);
     }
   }
+
+  layout = trackLayout(
+    layout,
+    rows.map((row) => rowApproval(row, approvals)).filter(Boolean).map((request) => request.id),
+    rows.map((row) => row.key),
+    now
+  );
 
   // Rebuild only when something visible changed.
   const signature = JSON.stringify([

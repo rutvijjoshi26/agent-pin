@@ -37,7 +37,7 @@ Agent Pin pulls that state out of the terminals and into one small window that s
    ```
 
    Hooks are only installed for agents whose config directory already exists (`~/.claude` for Claude Code, `~/.codex` for Codex). They are merged into `~/.claude/settings.json` and `~/.codex/hooks.json`.
-3. **Claude Code:** run `/hooks` to review and trust the new hooks. **Codex:** run `/hooks` to trust the new hooks.
+3. **Claude Code:** edits to `settings.json` are picked up automatically; you can optionally check the new hooks in `/hooks`, which is a read-only browser. **Codex:** run `/hooks` to trust the new hooks.
 
 The installer is careful with your config. It backs the file up to `<file>.agent-pin-backup-<timestamp>` before writing, writes atomically, keeps your key order, never removes a hook it didn't install, and skips the write entirely when nothing would change. Re-running it is safe.
 
@@ -80,7 +80,7 @@ One deliberate choice worth noting: Claude's `Notification` hook is **not** used
 
 ## Approve from Agent Pin
 
-When Claude Code or Codex asks for permission, the session's row shows the request with **Allow** and **Deny** buttons. It shows the request's summary, for example `Bash: rm -rf build`, and below the buttons the tool's input as formatted JSON in a scrollable box, every line of it. Input longer than 4000 characters is cut short; a request cut short cannot be allowed from Agent Pin. Its card says "Too long to show in full. Answer in the terminal." and offers **Deny** only. The buttons stay if the row flips back to running while the request waits, which subagents and parallel tool calls can cause. They are hidden while the pin is collapsed to status dots.
+When Claude Code or Codex asks for permission, the session's row shows the request with **Allow** and **Deny** buttons. It shows the request's summary, for example `Bash: rm -rf build`, and below the buttons the tool's input as formatted JSON in a scrollable box, every line of it. Formatted input longer than 4000 characters is cut short; a request cut short cannot be allowed from Agent Pin. Its card says "Too long to show in full. Answer in the terminal." and offers **Deny** only. The buttons stay if the row flips back to running while the request waits, which subagents and parallel tool calls can cause. They are hidden while the pin is collapsed to status dots.
 
 ### How it works
 
@@ -118,7 +118,9 @@ The Claude Code headless docs ([Run Claude Code programmatically](https://code.c
 
 ### Upgrading
 
-Hooks installed by an older Agent Pin show "<Agent> hooks need updating" in the setup panel until you click **Update**. The update makes Claude Code's `PermissionRequest` hook synchronous with a 600 s timeout (an async hook can't return a decision), gives Codex's the same timeout, and keeps your own hooks. Claude Code users then run `/hooks` to review the change; Codex users run `/hooks` to trust it.
+The installed `PermissionRequest` command carries a `--wait` argument (`agent-pin hook <provider> PermissionRequest --wait`). Only a hook with that marker posts a request and waits; without it the hook returns at once with no output, exactly as before approvals existed. So an old install whose async entry now runs this newer binary never waits for a click Claude would ignore, and it shows as needing an update until you reinstall.
+
+Hooks installed by an older Agent Pin show "<Agent> hooks need updating" in the setup panel until you click **Update**. The update makes Claude Code's `PermissionRequest` hook synchronous with a 600 s timeout (an async hook can't return a decision), gives Codex's the same timeout, and keeps your own hooks. Claude Code picks the change up automatically (you can optionally check it in `/hooks`); Codex users run `/hooks` to trust it.
 
 ### Platforms
 
@@ -137,9 +139,11 @@ Any provider id works (lowercase letters, digits and dashes). Point the agent's 
 agent-pin hook <id> <EventName>
 ```
 
-using Claude-style event names (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `StopFailure`, `SessionEnd`), with the hook's JSON payload on stdin. For example, `agent-pin hook antigravity PermissionRequest`.
+using Claude-style event names (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `StopFailure`, `SessionEnd`), with the hook's JSON payload on stdin. For example, `agent-pin hook antigravity PermissionRequest` (add `--wait` to take part in approvals).
 
-A `PermissionRequest` that names a tool waits for Allow or Deny for any provider, as described in [Approve from Agent Pin](#approve-from-agent-pin), and prints the decision in Claude Code's format. Give that hook a timeout of at least 600 s, or switch approvals off if your agent can't use the decision.
+The tools `AskUserQuestion` and `ExitPlanMode` are never offered for approval: Claude Code needs an `updatedInput` alongside an allow for them (see the [Hooks](https://code.claude.com/docs/en/hooks) reference), which a plain Allow would not carry, so they keep their normal terminal prompt.
+
+A `PermissionRequest` with the `--wait` argument that names a tool waits for Allow or Deny for any provider, as described in [Approve from Agent Pin](#approve-from-agent-pin), and prints the decision in Claude Code's format. Give that hook a timeout of at least 600 s, or switch approvals off if your agent can't use the decision.
 
 ## Linux
 

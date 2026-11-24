@@ -2,12 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  CLICK_GUARD_MS,
   HOLD_MAX_MS,
   ageText,
   approvalButtonLabel,
   approvalFor,
   approvalChoices,
   approvalLines,
+  decideAccepted,
   decisionFailed,
   decisionSent,
   decisionStarted,
@@ -24,7 +26,8 @@ import {
   SETTLED_NOTE_MS,
   pressHold,
   setupView,
-  statusMeta
+  statusMeta,
+  trackLayout
 } from "./view.js";
 
 const NOW = 10_000_000_000;
@@ -495,4 +498,46 @@ test("pruneDecisions does not mutate its input", () => {
   pruneDecisions(decisions, [], NOW + 60_000);
   assert.equal(decisions.size, 1);
   assert.equal(decisions.get(a.id).goneMs, null);
+});
+
+const SHOWN = [req("claude", "s1", 1), req("codex", "s2", 2)];
+
+test("a decide click is rejected until its request has been shown for 500 ms", () => {
+  const [a] = SHOWN;
+  let tracker = trackLayout(null, [a.id], ["claude__s1"], NOW);
+  assert.equal(decideAccepted(tracker, a.id, NOW), false);
+  assert.equal(decideAccepted(tracker, a.id, NOW + CLICK_GUARD_MS - 1), false);
+  tracker = trackLayout(tracker, [a.id], ["claude__s1"], NOW + 400);
+  assert.equal(decideAccepted(tracker, a.id, NOW + CLICK_GUARD_MS), true);
+  assert.equal(decideAccepted(tracker, a.id, NOW + 60_000), true);
+});
+
+test("a decide click is rejected for 500 ms after the approvals or the row order changes", () => {
+  const [a, b] = SHOWN;
+  let tracker = trackLayout(null, [a.id], ["claude__s1"], NOW);
+  tracker = trackLayout(tracker, [a.id], ["claude__s1"], NOW + 5000);
+  assert.equal(decideAccepted(tracker, a.id, NOW + 5000), true);
+  // A second request appears: the old button may have moved.
+  tracker = trackLayout(tracker, [a.id, b.id], ["claude__s1", "codex__s2"], NOW + 6000);
+  assert.equal(decideAccepted(tracker, a.id, NOW + 6100), false);
+  assert.equal(decideAccepted(tracker, b.id, NOW + 6100), false);
+  assert.equal(decideAccepted(tracker, a.id, NOW + 6500), true);
+  assert.equal(decideAccepted(tracker, b.id, NOW + 6500), true);
+  // Row order changes.
+  tracker = trackLayout(tracker, [a.id, b.id], ["codex__s2", "claude__s1"], NOW + 7000);
+  assert.equal(decideAccepted(tracker, a.id, NOW + 7499), false);
+  assert.equal(decideAccepted(tracker, a.id, NOW + 7500), true);
+  // An unchanged layout does not restart the clock; a gone request is forgotten.
+  tracker = trackLayout(tracker, [a.id, b.id], ["codex__s2", "claude__s1"], NOW + 9000);
+  assert.equal(decideAccepted(tracker, a.id, NOW + 9000), true);
+  tracker = trackLayout(tracker, [b.id], ["codex__s2"], NOW + 9100);
+  assert.equal(decideAccepted(tracker, a.id, NOW + 20_000), false);
+});
+
+test("trackLayout does not mutate its input", () => {
+  const [a] = SHOWN;
+  const first = trackLayout(null, [a.id], ["claude__s1"], NOW);
+  const copy = JSON.stringify([...first.firstSeen]);
+  trackLayout(first, [], [], NOW + 10);
+  assert.equal(JSON.stringify([...first.firstSeen]), copy);
 });

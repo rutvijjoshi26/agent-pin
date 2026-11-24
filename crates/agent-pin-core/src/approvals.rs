@@ -416,6 +416,18 @@ pub fn decide(dir: &Path, id: &str, b: Behavior) -> io::Result<()> {
             format!("no pending approval request {id:?}"),
         ));
     }
+    if b == Behavior::Allow {
+        let truncated = fs::read(req_path(dir, id))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Request>(&bytes).ok())
+            .is_some_and(|r| r.truncated);
+        if truncated {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("approval request {id:?} has truncated detail: it can only be denied"),
+            ));
+        }
+    }
     let body = serde_json::to_vec(&Decision { behavior: b }).map_err(io::Error::other)?;
     publish_new(&approvals_dir(dir), &format!("{id}.dec.json"), &body).map_err(|error| {
         if error.kind() == io::ErrorKind::AlreadyExists {
@@ -792,6 +804,21 @@ mod tests {
         let err = decide(dir, "claude__s1__1__abcd", Behavior::Allow).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert!(!dec_path(dir, "claude__s1__1__abcd").exists());
+    }
+
+    #[test]
+    fn decide_refuses_allow_for_truncated_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let input = bash(&"x".repeat(DETAIL_MAX + 500));
+        let r = new_request("claude", "s1", &input, T0);
+        assert!(r.truncated);
+        post(dir, &r).unwrap();
+        let err = decide(dir, &r.id, Behavior::Allow).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!dec_path(dir, &r.id).exists());
+        decide(dir, &r.id, Behavior::Deny).unwrap();
+        assert!(dec_path(dir, &r.id).exists());
     }
 
     #[test]
