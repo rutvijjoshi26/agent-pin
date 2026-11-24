@@ -15,8 +15,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::input::{truncate, HookInput};
-use crate::rows::project;
-use crate::session::pending_raw;
+use crate::rows::{project, Row};
+use crate::session::{pending_raw, Status};
 use crate::store::{check_stem, older_than, publish_new, write_bytes_atomic};
 
 /// How often [`wait`] polls for a decision.
@@ -308,6 +308,31 @@ pub fn list_pending(dir: &Path, now_ms: i64) -> Vec<Request> {
     }
     out.sort_by(|a, b| a.created_ms.cmp(&b.created_ms).then_with(|| a.id.cmp(&b.id)));
     out
+}
+
+/// Splits `pending` into the requests whose session row
+/// (`<provider>__<session_key>`) is in `rows` with status WaitingApproval,
+/// in their original order, and the ids of the rest, which no longer need a
+/// decision (the user answered in the terminal, or the session moved on).
+///
+/// The caller must list the requests before it builds `rows`: the hook marks
+/// its row waiting before it posts, so a request listed first always finds
+/// its row waiting unless the session has since moved on.
+pub fn pending_for_rows(pending: Vec<Request>, rows: &[Row]) -> (Vec<Request>, Vec<String>) {
+    let waiting = |r: &Request| {
+        let key = format!("{}__{}", r.provider, r.session_key);
+        rows.iter().any(|row| row.key == key && row.status == Status::WaitingApproval)
+    };
+    let (keep, stale): (Vec<Request>, Vec<Request>) = pending.into_iter().partition(waiting);
+    (keep, stale.into_iter().map(|r| r.id).collect())
+}
+
+/// Removes the request and decision files for each id, best effort. Ids
+/// outside `[A-Za-z0-9_-]` are skipped.
+pub fn remove(dir: &Path, ids: &[String]) {
+    for id in ids.iter().filter(|id| check_stem(id).is_ok()) {
+        remove_files(dir, id);
+    }
 }
 
 /// Removes `<dir>/app.alive.tmp-*` files older than 60 s.
@@ -897,5 +922,80 @@ mod tests {
         let exact = "z".repeat(200);
         let input = HookInput { tool_name: Some(exact.clone()), ..HookInput::default() };
         assert_eq!(new_request("claude", "s1", &input, T0).tool_name, exact);
+    }
+
+    fn row(key: &str, status: crate::session::Status) -> Row {
+        Row {
+            key: key.to_owned(),
+            label: String::new(),
+            project: None,
+            status,
+            quiet: false,
+            updated_ms: T0,
+            catch_up: crate::rows::CatchUp {
+                original_ask: None,
+                current_ask: None,
+                files_since_seen: Vec::new(),
+                commands_since_seen: Vec::new(),
+                unseen: false,
+            },
+            collisions: Vec::new(),
+        }
+    }
+
+    fn req(provider: &str, session_key: &str, n: i64) -> Request {
+        let mut r = new_request(provider, session_key, &bash("ls"), T0 + n);
+        r.id = format!("{provider}__{session_key}__{n}");
+        r
+    }
+
+    #[test]
+    fn pending_for_rows_keeps_only_waiting_sessions() {
+        use crate::session::Status;
+        let rows = [
+            row("claude__wait", Status::WaitingApproval),
+            row("claude__run", Status::Running),
+            row("claude__done", Status::Completed),
+            row("codex__wait", Status::WaitingApproval),
+        ];
+        let pending = vec![
+            req("claude", "wait", 1),
+            req("claude", "run", 2),
+            req("claude", "done", 3),
+            req("claude", "gone", 4),
+            req("codex", "wait", 5),
+            req("claude", "wait", 6),
+        ];
+        let (keep, drop) = pending_for_rows(pending, &rows);
+        let kept: Vec<&str> = keep.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(kept, ["claude__wait__1", "codex__wait__5", "claude__wait__6"]);
+        assert_eq!(drop, ["claude__run__2", "claude__done__3", "claude__gone__4"]);
+    }
+
+    #[test]
+    fn pending_for_rows_matches_provider_and_key_exactly() {
+        use crate::session::Status;
+        // Same session key under another provider is a different session.
+        let rows = [row("codex__s1", Status::WaitingApproval)];
+        let (keep, drop) = pending_for_rows(vec![req("claude", "s1", 1)], &rows);
+        assert!(keep.is_empty());
+        assert_eq!(drop, ["claude__s1__1"]);
+        let (keep, drop) = pending_for_rows(Vec::new(), &rows);
+        assert!(keep.is_empty() && drop.is_empty());
+    }
+
+    #[test]
+    fn remove_deletes_request_and_decision_and_skips_bad_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let r = new_request("claude", "s1", &bash("ls"), T0);
+        post(d, &r).unwrap();
+        decide(d, &r.id, Behavior::Allow).unwrap();
+        let outside = d.join("x.req.json");
+        fs::write(&outside, b"{}").unwrap();
+        remove(d, &[r.id.clone(), "../x".to_owned(), "missing".to_owned()]);
+        assert!(!req_path(d, &r.id).exists());
+        assert!(!dec_path(d, &r.id).exists());
+        assert!(outside.exists());
     }
 }

@@ -1,6 +1,7 @@
 //! Hook installer: merges agent-pin hook entries into the user's provider
 //! config files without touching the user's own hooks.
 
+use serde::Serialize;
 use serde_json::Value;
 use std::ffi::OsString;
 use std::fs;
@@ -254,24 +255,67 @@ pub fn install(home: &Path, exe: &Path, now_secs: i64) -> Result<Vec<String>, St
     Ok(ids)
 }
 
-/// One entry per provider whose config directory exists: true when its config
-/// holds exactly the entry [`merge`] installs for `exe` for every event the
-/// provider uses. Hooks pointing at a moved or older exe, or installed with
-/// older settings (an async PermissionRequest), read as false.
-pub fn installed(home: &Path, exe: &Path) -> Vec<(String, bool)> {
+/// How a provider's config matches the hooks [`merge`] would install.
+/// Serializes as `"missing"`, `"stale"` or `"current"`.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum HookStatus {
+    /// No agent-pin command at all.
+    Missing,
+    /// Some agent-pin command, but not exactly the current entries: hooks
+    /// pointing at a moved or older exe, the legacy Ruby script, or older
+    /// settings such as an async PermissionRequest.
+    Stale,
+    /// Exactly the entry [`merge`] installs for `exe`, for every event the
+    /// provider uses.
+    Current,
+}
+
+/// One entry per provider whose config directory exists. A missing,
+/// blank or unparsable config reads as [`HookStatus::Missing`].
+pub fn status(home: &Path, exe: &Path) -> Vec<(String, HookStatus)> {
     PROVIDERS
         .iter()
         .filter(|provider| provider_dir_exists(home, provider))
         .map(|provider| {
             let config = read_config(&home.join(provider.config_rel)).ok().flatten();
-            let ok = config.is_some_and(|config| {
-                provider.events.iter().all(|event| {
-                    let want = hook_entry(provider, event, exe);
-                    event_entries(&config, event).any(|entry| *entry == want)
-                })
-            });
-            (provider.id.to_string(), ok)
+            let status = match config {
+                None => HookStatus::Missing,
+                Some(config) => config_status(&config, provider, exe),
+            };
+            (provider.id.to_string(), status)
         })
+        .collect()
+}
+
+fn config_status(config: &Value, provider: &Provider, exe: &Path) -> HookStatus {
+    let current = provider.events.iter().all(|event| {
+        let want = hook_entry(provider, event, exe);
+        event_entries(config, event).any(|entry| *entry == want)
+    });
+    if current {
+        return HookStatus::Current;
+    }
+    let any_ours = config["hooks"]
+        .as_object()
+        .into_iter()
+        .flat_map(|events| events.keys())
+        .flat_map(|event| event_entries(config, event))
+        .filter_map(|entry| entry["command"].as_str())
+        .any(|cmd| is_ours(cmd, exe));
+    if any_ours {
+        HookStatus::Stale
+    } else {
+        HookStatus::Missing
+    }
+}
+
+/// One entry per provider whose config directory exists: true when its
+/// [`status`] is [`HookStatus::Current`].
+pub fn installed(home: &Path, exe: &Path) -> Vec<(String, bool)> {
+    status(home, exe)
+        .into_iter()
+        .map(|(id, status)| (id, status == HookStatus::Current))
         .collect()
 }
 
@@ -823,5 +867,79 @@ mod tests {
         let target: Value =
             serde_json::from_str(&fs::read_to_string(dotfiles.join("settings.json")).unwrap()).unwrap();
         assert_eq!(agent_pin_entries(&target, "Stop").len(), 1);
+    }
+
+    fn claude_home(config: Option<&str>) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir(home.path().join(".claude")).unwrap();
+        if let Some(text) = config {
+            fs::write(home.path().join(".claude/settings.json"), text).unwrap();
+        }
+        home
+    }
+
+    #[test]
+    fn status_missing_without_agent_pin_commands() {
+        let user_only = serde_json::json!({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": USER_CMD}
+        ]}]}})
+        .to_string();
+        for config in [None, Some(""), Some(user_only.as_str())] {
+            let home = claude_home(config);
+            assert_eq!(
+                status(home.path(), &exe()),
+                vec![("claude".to_string(), HookStatus::Missing)],
+                "{config:?}"
+            );
+            assert_eq!(installed(home.path(), &exe()), vec![("claude".to_string(), false)]);
+        }
+        // A provider with no config directory is not listed at all.
+        assert!(status(tempfile::tempdir().unwrap().path(), &exe()).is_empty());
+    }
+
+    #[test]
+    fn status_current_after_install() {
+        let home = claude_home(None);
+        fs::create_dir(home.path().join(".codex")).unwrap();
+        install(home.path(), &exe(), 1).unwrap();
+        assert_eq!(
+            status(home.path(), &exe()),
+            vec![
+                ("claude".to_string(), HookStatus::Current),
+                ("codex".to_string(), HookStatus::Current)
+            ]
+        );
+    }
+
+    #[test]
+    fn status_stale_for_old_async_permission_entry() {
+        let text = serde_json::to_string_pretty(&old_async_install()).unwrap();
+        let home = claude_home(Some(&text));
+        assert_eq!(status(home.path(), &exe()), vec![("claude".to_string(), HookStatus::Stale)]);
+        assert_eq!(installed(home.path(), &exe()), vec![("claude".to_string(), false)]);
+    }
+
+    #[test]
+    fn status_stale_after_exe_moved() {
+        let home = claude_home(None);
+        install(home.path(), &appimage(), 1).unwrap();
+        let moved = PathBuf::from("/home/u/Applications/Agent Pin_0.1.0_amd64.AppImage");
+        assert_eq!(status(home.path(), &moved), vec![("claude".to_string(), HookStatus::Stale)]);
+        assert_eq!(status(home.path(), &appimage()), vec![("claude".to_string(), HookStatus::Current)]);
+    }
+
+    #[test]
+    fn status_stale_for_legacy_only() {
+        let home = claude_home(Some(SHARED_GROUP));
+        assert_eq!(status(home.path(), &exe()), vec![("claude".to_string(), HookStatus::Stale)]);
+    }
+
+    #[test]
+    fn hook_status_serializes_lowercase() {
+        let names: Vec<String> = [HookStatus::Missing, HookStatus::Stale, HookStatus::Current]
+            .iter()
+            .map(|s| serde_json::to_string(s).unwrap())
+            .collect();
+        assert_eq!(names, ["\"missing\"", "\"stale\"", "\"current\""]);
     }
 }
