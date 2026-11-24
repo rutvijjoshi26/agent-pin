@@ -95,6 +95,7 @@ The hook prints nothing, and the agent falls back to its normal permission promp
 
 - **Agent Pin isn't running.** The app refreshes `app.alive` in the state directory every second, and the hook treats a file 3 s old as a stopped app. A hook started without the app returns at once. One that is waiting when the app quits or crashes returns within about 3 s.
 - **Approvals are switched off.** Untick **Approve from Agent Pin** in the setup panel. This takes effect at once: a hook that is already waiting checks the switch on every 200 ms poll, returns with no decision and removes its request, so its card goes away and the agent shows its normal prompt.
+- **The agent is asking a question or for plan approval** (Claude Code's `AskUserQuestion` and `ExitPlanMode`). These need an answer, not just Allow, so they always stay in the terminal and their row shows no buttons.
 - **No click within about 10 minutes.** The hook gives up after 590 s, inside its 600 s timeout.
 - **The card is dropped.** The app drops a request when its session has completed, gone idle or errored, and when its hook has stopped refreshing the request file for about 5 s (the hook refreshes it every 200 ms while it waits). A waiting hook whose request is dropped returns with no decision.
 - **Anything goes wrong**, such as a file that can't be written or read, or a decision file that isn't exactly an Allow or a Deny.
