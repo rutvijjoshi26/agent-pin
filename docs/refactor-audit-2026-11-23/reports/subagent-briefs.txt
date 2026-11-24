@@ -1,0 +1,14 @@
+Two critics were spawned (limit 3). Both got the file list and the code, not the auditor's conclusions, and were asked for the strongest objections, not validation. Both were read-only.
+
+1. Feature skeptic / deletion advocate: argue what to remove; also the strongest case for keeping what a naive deleter would wrongly remove. Every claim cites file:line; verdict + confidence.
+2. Boundary and hand-rolled machinery critic: mixed responsibilities, hidden policy, stringly-typed state; for each custom mechanism name the std/Tauri/crate alternative; concurrency, growth, timestamps, cross-platform, hook exit codes. Web search allowed.
+
+The third slot was not used. A migration-realist pass was folded into target-and-roadmap.md instead.
+
+Full outputs are summarized in the sibling files. The auditor's integration is in ../smells.md. Corrections accepted from critics:
+- PostToolUse -> running is load-bearing (clears waiting_approval).
+- No windows_subsystem in main.rs.
+- AGENT_PIN_HOME is honored by the writer only.
+- UTF-8 tail read failure.
+- Stale exe path counted as installed.
+- Positioner plugin lacks margin.
