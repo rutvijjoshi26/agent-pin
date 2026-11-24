@@ -3,12 +3,20 @@
 import {
   HOLD_MAX_MS,
   ageText,
+  approvalButtonLabel,
+  approvalLines,
   cardCatchUp,
   catchUpLines,
   collisionText,
+  decisionFailed,
+  decisionSent,
+  decisionStarted,
+  decisionView,
   installedNote,
   isHeld,
   pressHold,
+  pruneDecisions,
+  rowApproval,
   setupView,
   statusMeta
 } from "./view.js";
@@ -20,6 +28,8 @@ const invoke = (command, args) => window.__TAURI__.core.invoke(command, args);
 const pin = document.querySelector("#pin");
 const agents = document.querySelector("#agents");
 const setup = document.querySelector("#setup");
+const setupNoteBox = document.querySelector("#setup-note");
+const approvalsToggle = document.querySelector("#approvals-toggle");
 const setupTitle = document.querySelector("#setup-title");
 const setupDetail = document.querySelector("#setup-detail");
 const setupWayland = document.querySelector("#setup-wayland");
@@ -28,6 +38,10 @@ const setupButton = document.querySelector("#setup-button");
 let expanded = true;
 let rows = [];
 let rowsError = null;
+// Pending approval requests from the last poll (see read_approvals).
+let approvals = [];
+// Clicked Allow/Deny decisions by request id (see view.js decisionStarted).
+let decisions = new Map();
 let renderedSignature = "";
 // Open cards, keyed by row key, mapped to the row's catch_up as it was just
 // before mark_seen emptied the backend's since-seen lists.
@@ -73,6 +87,11 @@ pin.addEventListener("dblclick", (event) => {
 });
 
 agents.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-decide]");
+  if (button) {
+    decideFrom(button);
+    return;
+  }
   const row = event.target.closest(".agent[data-key]");
   if (!expanded || !row) {
     return;
@@ -90,6 +109,35 @@ agents.addEventListener("click", (event) => {
   renderRows(true);
 });
 
+// Sends one decision. Both buttons stay disabled until the poll after
+// decide settles; a rejected decide shows "No longer pending" instead.
+function decideFrom(button) {
+  const id = button.dataset.id;
+  if (!id || decisions.has(id)) {
+    return;
+  }
+  const allow = button.dataset.decide === "allow";
+  for (const sibling of button.parentElement.querySelectorAll("button")) {
+    sibling.disabled = true;
+  }
+  decisions.set(id, decisionStarted(allow, Date.now()));
+  renderRows(true);
+  invoke("decide", { id, allow })
+    .then(() => settle(id, decisionSent))
+    .catch((error) => {
+      console.warn("Unable to decide", error);
+      settle(id, decisionFailed);
+    });
+}
+
+function settle(id, next) {
+  const decision = decisions.get(id);
+  if (decision) {
+    decisions.set(id, next(decision, Date.now()));
+    renderRows(true);
+  }
+}
+
 for (const type of ["pointerup", "pointercancel", "blur"]) {
   window.addEventListener(type, releaseHold);
 }
@@ -102,6 +150,20 @@ function releaseHold() {
     setTimeout(() => renderRows(true), 0);
   }
 }
+
+approvalsToggle.addEventListener("change", async () => {
+  const on = approvalsToggle.checked;
+  approvalsToggle.disabled = true;
+  try {
+    await invoke("set_approvals_enabled", { on });
+  } catch (error) {
+    setupNote = { title: "Approvals switch failed", text: String(error) };
+    renderSetup();
+  } finally {
+    await refreshApprovalsEnabled();
+    approvalsToggle.disabled = false;
+  }
+});
 
 setupButton.addEventListener("click", async () => {
   installing = true;
@@ -119,10 +181,11 @@ setupButton.addEventListener("click", async () => {
 
 new ResizeObserver(fitWindow).observe(pin);
 
-// Buttons always take clicks; rows and cards only while expanded, since the
-// collapsed pin shows bare dots and is dragged or double-clicked anywhere.
+// Buttons and the approvals switch always take clicks; rows and cards only
+// while expanded, since the collapsed pin shows bare dots and is dragged or
+// double-clicked anywhere.
 function isInteractive(target) {
-  return Boolean(target.closest("button") || (expanded && target.closest(".session")));
+  return Boolean(target.closest("button, input, label") || (expanded && target.closest(".session")));
 }
 
 function fitWindow() {
@@ -141,13 +204,25 @@ function fitWindow() {
 }
 
 async function refresh() {
-  try {
-    rows = await invoke("read_rows");
+  const pollStartedMs = Date.now();
+  const [rowsResult, approvalsResult] = await Promise.allSettled([
+    invoke("read_rows"),
+    invoke("read_approvals")
+  ]);
+  if (rowsResult.status === "fulfilled") {
+    rows = rowsResult.value;
     rowsError = null;
-  } catch (error) {
+  } else {
     rows = [];
-    rowsError = String(error);
+    rowsError = String(rowsResult.reason);
   }
+  if (approvalsResult.status === "fulfilled") {
+    approvals = approvalsResult.value;
+  } else {
+    approvals = [];
+    console.warn("Unable to read approvals", approvalsResult.reason);
+  }
+  decisions = pruneDecisions(decisions, approvals, pollStartedMs);
   renderRows(false);
 }
 
@@ -170,7 +245,9 @@ function renderRows(force) {
     rows,
     rows.map((row) => ageText(row.updated_ms, now)),
     [...openCards.keys()],
-    rowsError
+    rowsError,
+    approvals,
+    [...decisions]
   ]);
   if (!force && signature === renderedSignature) {
     return;
@@ -185,7 +262,17 @@ function renderRows(force) {
     agents.replaceChildren(placeholder("idle", "No active sessions", ""));
     return;
   }
+  // A rebuild replaces the buttons, so keep keyboard focus on the same one.
+  const focused = document.activeElement && document.activeElement.dataset
+    ? document.activeElement.dataset.focusId
+    : undefined;
   agents.replaceChildren(...rows.map((row) => session(row, now)));
+  if (focused) {
+    const again = [...agents.querySelectorAll("[data-focus-id]")].find((node) => node.dataset.focusId === focused);
+    if (again && !again.disabled) {
+      again.focus();
+    }
+  }
 }
 
 function session(row, now) {
@@ -211,21 +298,67 @@ function session(row, now) {
     node.appendChild(line);
   }
 
+  const request = rowApproval(row, approvals);
+  if (request) {
+    node.appendChild(approvalStrip(request));
+  }
+
   if (open) {
-    node.appendChild(card(cardCatchUp(row.catch_up, openCards.get(row.key))));
+    node.appendChild(card(cardCatchUp(row.catch_up, openCards.get(row.key)), request));
   }
   return node;
 }
 
-function card(catchUp) {
+// The request's summary with Allow and Deny. Not inside .agent[data-key],
+// so a click on it never toggles the card.
+function approvalStrip(request) {
+  const view = decisionView(decisions.get(request.id));
+  const node = el("div", "approval");
+  node.setAttribute("data-expanded-only", "");
+  const summary = el("div", "approval__summary", approvalLines(request)[0]);
+  summary.title = approvalLines(request)[0];
+  node.appendChild(summary);
+  const actions = el("div", "approval__actions");
+  for (const allow of [true, false]) {
+    const button = el(
+      "button",
+      `approval__button ${allow ? "approval__button--allow" : "approval__button--deny"}`,
+      allow ? "Allow" : "Deny"
+    );
+    button.type = "button";
+    button.dataset.decide = allow ? "allow" : "deny";
+    button.dataset.id = request.id;
+    button.dataset.focusId = `${request.id}:${button.dataset.decide}`;
+    button.setAttribute("aria-label", approvalButtonLabel(allow, request));
+    button.disabled = view.disabled;
+    actions.appendChild(button);
+  }
+  node.appendChild(actions);
+  if (view.note) {
+    const note = el("div", "approval__note", view.note);
+    note.setAttribute("role", "status");
+    node.appendChild(note);
+  }
+  return node;
+}
+
+function card(catchUp, request) {
   const node = el("div", "card");
   node.setAttribute("data-expanded-only", "");
   const lines = catchUpLines(catchUp);
-  if (!lines.length) {
+  const detail = approvalLines(request).slice(1);
+  if (!lines.length && !detail.length) {
     node.appendChild(el("div", "card__line card__line--empty", "Nothing new since you looked"));
   }
   for (const line of lines) {
     node.appendChild(el("div", "card__line", line));
+  }
+  if (detail.length) {
+    const block = el("div", "card__detail");
+    for (const line of detail) {
+      block.appendChild(el("div", "card__detail-line", line));
+    }
+    node.appendChild(block);
   }
   return node;
 }
@@ -262,11 +395,13 @@ function el(tag, className, text) {
   return node;
 }
 
+// The setup section always holds the approvals switch; its note shows only
+// when there is something to say.
 function renderSetup() {
   const view = setupView(integrations, setupNote);
-  const visible = expanded && view.visible;
-  setup.hidden = !visible;
-  if (!visible) {
+  setup.hidden = !expanded;
+  setupNoteBox.hidden = !view.visible;
+  if (!expanded || !view.visible) {
     return;
   }
 
@@ -276,7 +411,15 @@ function renderSetup() {
   setupWayland.hidden = !view.wayland;
   setupButton.hidden = !view.button;
   setupButton.disabled = installing;
-  setupButton.textContent = installing ? "..." : "Set up";
+  setupButton.textContent = installing ? "..." : view.buttonLabel;
+}
+
+async function refreshApprovalsEnabled() {
+  try {
+    approvalsToggle.checked = Boolean(await invoke("approvals_enabled"));
+  } catch (error) {
+    console.warn("Unable to read the approvals switch", error);
+  }
 }
 
 async function refreshIntegrations() {
@@ -291,4 +434,5 @@ async function refreshIntegrations() {
 
 refresh();
 refreshIntegrations();
+refreshApprovalsEnabled();
 setInterval(refresh, POLL_MS);

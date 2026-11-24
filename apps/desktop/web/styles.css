@@ -111,6 +111,7 @@ body {
 
 .setup__detail {
   margin-top: 4px;
+  white-space: pre-line;
   overflow-wrap: anywhere;
   font-size: 9px;
   line-height: 12px;
@@ -271,4 +272,87 @@ body {
 
 .is-quiet .agent__status {
   color: rgba(255, 255, 255, 0.56);
+}
+
+.setup__note {
+  margin-bottom: 6px;
+}
+.setup__toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 22px;
+  font-size: 10px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.82);
+  cursor: pointer;
+}
+.setup__toggle input {
+  margin: 0;
+}
+
+/* Allow / Deny under a waiting row. */
+.approval {
+  display: grid;
+  gap: 4px;
+  margin: 2px 0 2px 23px;
+}
+.approval__summary {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  line-height: 13px;
+  color: rgba(255, 255, 255, 0.82);
+}
+.approval__actions {
+  display: flex;
+  gap: 6px;
+}
+.approval__button {
+  flex: 1;
+  min-height: 28px;
+  padding: 0 8px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 5px;
+  color: rgba(255, 255, 255, 0.94);
+  background: rgba(255, 255, 255, 0.12);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.approval__button--allow {
+  border-color: rgba(41, 173, 92, 0.7);
+  background: rgba(41, 173, 92, 0.28);
+}
+.approval__button--deny {
+  border-color: rgba(224, 51, 61, 0.7);
+  background: rgba(224, 51, 61, 0.24);
+}
+.approval__button:focus-visible {
+  outline: 2px solid #4fa3ff;
+  outline-offset: 1px;
+}
+.approval__button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.approval__note {
+  font-size: 9px;
+  line-height: 12px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.7);
+}
+.card__detail {
+  margin-top: 2px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.card__detail-line {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: pre;
+  font-size: 9px;
+  line-height: 12px;
+  color: rgba(255, 255, 255, 0.7);
 }

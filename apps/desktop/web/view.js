@@ -108,35 +108,58 @@ export function isHeld(holdSince, nowMs) {
 
 const NO_CONFIG = "No Claude Code or Codex config found (~/.claude or ~/.codex)";
 
+// What to run after installing each provider's hooks.
+const TRUST_LINES = {
+  claude: "Claude: run /hooks in Claude Code to review and trust the hooks",
+  codex: "Codex: run /hooks in Codex to trust the updated hooks"
+};
+
 /**
- * The setup note after an install, from the provider ids it installed:
- * Claude needs its hooks trusted via /hooks; Codex alone just confirms.
+ * The setup note after an install, from the provider ids it installed: one
+ * line per installed provider saying how to trust its hooks.
  */
 export function installedNote(ids) {
   const list = Array.isArray(ids) ? ids : [];
   if (list.length === 0) {
     return { title: "No agents found", text: NO_CONFIG };
   }
-  if (list.includes("claude")) {
-    return { title: "Hooks installed", text: "Run /hooks in Claude Code to review and trust the new hooks" };
+  const lines = list.map((id) => TRUST_LINES[id] || `${capitalize(id)} hooks installed`);
+  return { title: "Hooks installed", text: lines.join("\n") };
+}
+
+// A provider's hook status; one without a status reads from `installed`.
+function hookStatus(provider) {
+  if (provider.status === "missing" || provider.status === "stale" || provider.status === "current") {
+    return provider.status;
   }
-  return { title: "Hooks installed", text: `${list.map(capitalize).join(" + ")} hooks installed` };
+  return provider.installed ? "current" : "missing";
 }
 
 /**
  * What the setup panel shows, from read_integrations' result (null when it
- * failed) and the current note ({ title, text } or null).
+ * failed) and the current note ({ title, text } or null). Missing hooks are
+ * offered "Set up"; hooks from an older Agent Pin are offered "Update".
  */
 export function setupView(integrations, note) {
   const providers = integrations && Array.isArray(integrations.providers) ? integrations.providers : null;
-  const missing = (providers || []).filter((provider) => !provider.installed).map((p) => capitalize(p.id));
+  const lines = [];
+  let anyMissing = false;
+  for (const provider of providers || []) {
+    const status = hookStatus(provider);
+    if (status === "missing") {
+      anyMissing = true;
+      lines.push(`${capitalize(provider.id)} hooks missing`);
+    } else if (status === "stale") {
+      lines.push(`${capitalize(provider.id)} hooks need updating`);
+    }
+  }
   const noConfig = providers !== null && providers.length === 0;
   const wayland = Boolean(integrations && integrations.wayland);
   let title = "Note";
   let detail = "";
-  if (missing.length > 0) {
-    title = "Setup needed";
-    detail = note ? note.text : `${missing.join(" + ")} hooks missing`;
+  if (lines.length > 0) {
+    title = anyMissing ? "Setup needed" : "Update needed";
+    detail = note ? note.text : lines.join("\n");
   } else if (note) {
     title = note.title;
     detail = note.text;
@@ -149,8 +172,108 @@ export function setupView(integrations, note) {
     title,
     detail,
     wayland,
-    button: missing.length > 0
+    button: lines.length > 0,
+    buttonLabel: lines.length > 0 && !anyMissing ? "Update" : "Set up"
   };
+}
+
+const MAX_DETAIL_LINES = 6;
+
+/**
+ * The pending approval request for a row (key `provider__session_key`), or
+ * null. With several, the newest by created_ms wins.
+ */
+export function approvalFor(rowKey, approvals) {
+  let best = null;
+  for (const req of Array.isArray(approvals) ? approvals : []) {
+    if (`${req.provider}__${req.session_key}` !== rowKey) {
+      continue;
+    }
+    if (best === null || req.created_ms > best.created_ms) {
+      best = req;
+    }
+  }
+  return best;
+}
+
+/** The request a row offers Allow and Deny for: only waiting rows have one. */
+export function rowApproval(row, approvals) {
+  return row.status === "waiting_approval" ? approvalFor(row.key, approvals) : null;
+}
+
+/** The request's summary (or tool name), then the first 6 lines of its detail. */
+export function approvalLines(req) {
+  if (!req) {
+    return [];
+  }
+  const detail = req.detail ? String(req.detail).split(/\r?\n/).slice(0, MAX_DETAIL_LINES) : [];
+  return [approvalTitle(req), ...detail];
+}
+
+/** "Allow Bash: rm -rf build" or "Deny Bash: rm -rf build". */
+export function approvalButtonLabel(allow, req) {
+  return `${allow ? "Allow" : "Deny"} ${approvalTitle(req)}`;
+}
+
+function approvalTitle(req) {
+  return String(req.summary || req.tool_name || "");
+}
+
+/**
+ * A click's decision, from click until the poll after `decide` settles.
+ * `settledMs` is null while `decide` is in flight.
+ */
+export function decisionStarted(allow, nowMs) {
+  return { allow, startedMs: nowMs, settledMs: null, failed: false };
+}
+
+/** The decision once `decide` resolved. */
+export function decisionSent(decision, nowMs) {
+  return { ...decision, settledMs: nowMs };
+}
+
+/** The decision once `decide` rejected: the request is no longer pending. */
+export function decisionFailed(decision, nowMs) {
+  return { ...decision, settledMs: nowMs, failed: true };
+}
+
+/**
+ * How a request's buttons look: enabled with no decision; once clicked,
+ * disabled with a note. A failed decide never reads as success.
+ */
+export function decisionView(decision) {
+  if (!decision) {
+    return { disabled: false, note: null };
+  }
+  if (decision.failed) {
+    return { disabled: true, note: "No longer pending" };
+  }
+  if (decision.settledMs === null) {
+    return { disabled: true, note: "Sending..." };
+  }
+  return { disabled: true, note: decision.allow ? "Allowed" : "Denied" };
+}
+
+/**
+ * The decisions to keep after a poll that started at `pollStartedMs` and
+ * listed `approvals`. A decision goes once its request is no longer listed;
+ * a sent one also goes at the first poll that started after `decide`
+ * settled, so its buttons stay disabled until then. A failed one stays
+ * while its request is listed, so nothing is re-enabled.
+ */
+export function pruneDecisions(decisions, approvals, pollStartedMs) {
+  const listed = new Set((Array.isArray(approvals) ? approvals : []).map((req) => req.id));
+  const kept = new Map();
+  for (const [id, decision] of decisions) {
+    if (!listed.has(id)) {
+      continue;
+    }
+    const done = !decision.failed && decision.settledMs !== null && pollStartedMs > decision.settledMs;
+    if (!done) {
+      kept.set(id, decision);
+    }
+  }
+  return kept;
 }
 
 function capitalize(id) {
