@@ -192,6 +192,7 @@ mod tests {
             original_ask: None,
             last_ask: None,
             pending: None,
+            pending_ms: 0,
             files: Vec::new(),
             commands: Vec::new(),
         }

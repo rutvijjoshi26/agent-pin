@@ -43,6 +43,9 @@ pub struct SessionState {
     pub original_ask: Option<String>,
     pub last_ask: Option<String>,
     pub pending: Option<String>,
+    /// When the pending permission request arrived (Unix ms).
+    #[serde(default)]
+    pub pending_ms: i64,
     pub files: Vec<FileTouch>,
     pub commands: Vec<CommandRun>,
 }
@@ -80,6 +83,7 @@ pub fn apply(
         original_ask: None,
         last_ask: None,
         pending: None,
+        pending_ms: 0,
         files: Vec::new(),
         commands: Vec::new(),
     });
@@ -88,13 +92,17 @@ pub fn apply(
     // nor serves as a join base.
     let input_cwd = input.cwd.as_deref().filter(|c| !c.is_empty());
     if let Some(cwd) = input_cwd {
-        s.cwd = Some(clean(cwd, TEXT_MAX));
+        s.cwd = Some(clean_tail(cwd, TEXT_MAX));
     }
     let tool = input.tool_name.as_deref();
     match kind {
-        HookKind::SessionStart => s.status = Status::Idle,
+        HookKind::SessionStart => {
+            s.status = Status::Idle;
+            s.pending = None;
+        }
         HookKind::UserPromptSubmit => {
             s.status = Status::Running;
+            s.pending = None;
             if let Some(prompt) = &input.prompt {
                 let ask = clean(prompt, TEXT_MAX);
                 if s.original_ask.is_none() {
@@ -104,28 +112,26 @@ pub fn apply(
             }
         }
         HookKind::PreToolUse => {
-            s.status = Status::Running;
+            // A PreToolUse for the pending tool is its precursor arriving
+            // late (async hooks race), so only time ends the wait here.
+            resume_unless_waiting(&mut s, false, now_ms);
             let edits = matches!(tool, Some("Edit" | "Write" | "MultiEdit" | "NotebookEdit"));
             if let Some(path) = input.file_path.as_deref().filter(|_| edits) {
                 // Join with the raw input cwd: the stored one may be truncated.
                 let cwd = input_cwd.or(s.cwd.as_deref());
                 let path = absolute(cwd, path);
-                let touch = FileTouch { path: clean(&path, PATH_MAX), at_ms: now_ms };
+                let touch = FileTouch { path: clean_tail(&path, PATH_MAX), at_ms: now_ms };
                 push_capped(&mut s.files, touch);
             }
         }
         HookKind::PermissionRequest => {
             s.status = Status::WaitingApproval;
-            let name = tool.unwrap_or("Tool");
-            let pending = match input.command.as_ref().or(input.file_path.as_ref()) {
-                Some(detail) => format!("{name}: {detail}"),
-                None => name.to_owned(),
-            };
-            s.pending = Some(clean(&pending, TEXT_MAX));
+            s.pending = Some(pending_text(input));
+            s.pending_ms = now_ms;
         }
         HookKind::PostToolUse | HookKind::PostToolUseFailure => {
-            s.status = Status::Running;
-            s.pending = None;
+            let same_tool = s.pending.as_deref() == Some(pending_text(input).as_str());
+            resume_unless_waiting(&mut s, same_tool, now_ms);
             let ok = kind == HookKind::PostToolUse;
             let record = !ok || tool == Some("Bash");
             if let Some(command) = input.command.as_deref().filter(|_| record) {
@@ -137,11 +143,41 @@ pub fn apply(
             s.status = Status::Completed;
             s.pending = None;
         }
-        HookKind::StopFailure => s.status = Status::Error,
+        HookKind::StopFailure => {
+            s.status = Status::Error;
+            s.pending = None;
+        }
         // Returned early above; kept non-panicking so the hook never panics.
         HookKind::SessionEnd | HookKind::Other => {}
     }
     Some(s)
+}
+
+/// How long after a permission request an unrelated tool event still counts
+/// as racing it rather than as the agent having moved on.
+const PENDING_GRACE_MS: i64 = 1000;
+
+/// Sets the session Running and clears `pending`, except while it waits for
+/// approval and the event may be an async hook that overtook the request:
+/// the wait ends only when `same_tool` or the grace period has passed.
+fn resume_unless_waiting(s: &mut SessionState, same_tool: bool, now_ms: i64) {
+    let waiting = s.status == Status::WaitingApproval
+        && !same_tool
+        && now_ms - s.pending_ms < PENDING_GRACE_MS;
+    if !waiting {
+        s.status = Status::Running;
+        s.pending = None;
+    }
+}
+
+/// `"<tool>: <command or file_path>"`, cleaned, as stored in `pending`.
+fn pending_text(input: &HookInput) -> String {
+    let name = input.tool_name.as_deref().unwrap_or("Tool");
+    let pending = match input.command.as_ref().or(input.file_path.as_ref()) {
+        Some(detail) => format!("{name}: {detail}"),
+        None => name.to_owned(),
+    };
+    clean(&pending, TEXT_MAX)
 }
 
 /// The session's file key: `session_id` sanitized to `[A-Za-z0-9_-]`
@@ -169,6 +205,18 @@ fn clean(s: &str, max_chars: usize) -> String {
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
+}
+
+/// Like [`clean`] but keeps the last `max_chars`, prefixed with "…", so a
+/// long path keeps its project or file name.
+fn clean_tail(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    let tail: String = if count > max_chars {
+        std::iter::once('…').chain(s.chars().skip(count - max_chars)).collect()
+    } else {
+        s.to_owned()
+    };
+    clean(&tail, max_chars + 1)
 }
 
 /// Appends `item`, keeping only the last `LIST_MAX` items.
@@ -336,7 +384,7 @@ mod tests {
         let req = tool("Edit", None, Some(&huge));
         let s = apply(Some(started()), "claude", HookKind::PreToolUse, &req, 2).unwrap();
         assert_eq!(s.files[0].path.chars().count(), 401);
-        assert!(s.files[0].path.ends_with('…'));
+        assert!(s.files[0].path.starts_with('…'));
     }
 
     #[test]
@@ -484,6 +532,108 @@ mod tests {
         assert_eq!(k("../.."), "default");
         assert_eq!(k(""), "default");
         assert_eq!(k(&"a".repeat(100)).len(), 64);
+    }
+
+    fn waiting(cmd: &str, at: i64) -> SessionState {
+        let req = tool("Bash", Some(cmd), None);
+        apply(Some(started()), "claude", HookKind::PermissionRequest, &req, at).unwrap()
+    }
+
+    #[test]
+    fn permission_request_records_pending_ms() {
+        assert_eq!(waiting("ls", 1000).pending_ms, 1000);
+    }
+
+    #[test]
+    fn late_pre_tool_use_for_same_tool_keeps_waiting() {
+        let s = waiting("rm -rf build", 1000);
+        let pre = tool("Bash", Some("rm -rf build"), None);
+        let s = apply(Some(s), "claude", HookKind::PreToolUse, &pre, 1500).unwrap();
+        assert_eq!(s.status, Status::WaitingApproval);
+        assert_eq!(s.pending.as_deref(), Some("Bash: rm -rf build"));
+        assert_eq!(s.updated_ms, 1500);
+    }
+
+    #[test]
+    fn post_tool_use_for_pending_tool_clears_waiting() {
+        let s = waiting("rm -rf build", 1000);
+        let post = tool("Bash", Some("rm -rf build"), None);
+        let s = apply(Some(s), "claude", HookKind::PostToolUse, &post, 1200).unwrap();
+        assert_eq!(s.status, Status::Running);
+        assert_eq!(s.pending, None);
+    }
+
+    #[test]
+    fn unrelated_post_tool_use_within_1s_keeps_waiting_but_records() {
+        let s = waiting("rm -rf build", 1000);
+        let read = tool("Read", None, Some("/r/a.rs"));
+        let s = apply(Some(s), "claude", HookKind::PostToolUse, &read, 1999).unwrap();
+        assert_eq!(s.status, Status::WaitingApproval);
+        assert_eq!(s.pending.as_deref(), Some("Bash: rm -rf build"));
+        // Work from other tools is still recorded while waiting.
+        let edit = tool("Edit", None, Some("b.rs"));
+        let s = apply(Some(s), "claude", HookKind::PreToolUse, &edit, 1999).unwrap();
+        assert_eq!(s.status, Status::WaitingApproval);
+        assert_eq!(s.files[0].path, "/r/b.rs");
+        let other = tool("Bash", Some("make"), None);
+        let s = apply(Some(s), "claude", HookKind::PostToolUseFailure, &other, 1999).unwrap();
+        assert_eq!(s.status, Status::WaitingApproval);
+        assert_eq!(s.commands[0].command, "make");
+    }
+
+    #[test]
+    fn unrelated_tool_use_after_1s_clears_waiting() {
+        let read = tool("Read", None, Some("/r/a.rs"));
+        let s = apply(Some(waiting("ls", 1000)), "claude", HookKind::PostToolUse, &read, 2000).unwrap();
+        assert_eq!(s.status, Status::Running);
+        assert_eq!(s.pending, None);
+        let s = apply(Some(waiting("ls", 1000)), "claude", HookKind::PreToolUse, &read, 2000).unwrap();
+        assert_eq!(s.status, Status::Running);
+        assert_eq!(s.pending, None);
+    }
+
+    #[test]
+    fn prompt_stop_and_start_clear_waiting_at_once() {
+        for kind in [
+            HookKind::UserPromptSubmit,
+            HookKind::Stop,
+            HookKind::StopFailure,
+            HookKind::SessionStart,
+        ] {
+            let s = apply(Some(waiting("ls", 1000)), "claude", kind, &input(), 1001).unwrap();
+            assert_ne!(s.status, Status::WaitingApproval, "{kind:?}");
+            assert_eq!(s.pending, None, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn pending_ms_defaults_to_zero() {
+        let mut v = serde_json::to_value(started()).unwrap();
+        v.as_object_mut().unwrap().remove("pending_ms");
+        let s: SessionState = serde_json::from_value(v).unwrap();
+        assert_eq!(s.pending_ms, 0);
+    }
+
+    #[test]
+    fn long_cwd_keeps_its_end() {
+        let cwd = format!("/{}/my-project", "d".repeat(300));
+        let req = HookInput { cwd: Some(cwd.clone()), ..input() };
+        let s = apply(Some(started()), "claude", HookKind::Stop, &req, 2).unwrap();
+        let kept = s.cwd.unwrap();
+        assert_eq!(kept.chars().count(), TEXT_MAX + 1);
+        assert!(kept.starts_with('…'), "{kept}");
+        assert!(kept.ends_with("/my-project"), "{kept}");
+        assert_eq!(&kept['…'.len_utf8()..], &cwd[cwd.len() - TEXT_MAX..]);
+    }
+
+    #[test]
+    fn long_file_path_keeps_its_end() {
+        let huge = format!("/{}/main.rs", "p".repeat(2000));
+        let req = tool("Edit", None, Some(&huge));
+        let s = apply(Some(started()), "claude", HookKind::PreToolUse, &req, 2).unwrap();
+        let path = &s.files[0].path;
+        assert_eq!(path.chars().count(), PATH_MAX + 1);
+        assert!(path.starts_with('…') && path.ends_with("/main.rs"), "{path}");
     }
 
     #[test]
