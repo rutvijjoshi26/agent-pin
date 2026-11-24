@@ -2,10 +2,11 @@
 //! `<state_dir>/sessions/<provider>__<session_key>.json`.
 
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::session::SessionState;
 
@@ -25,9 +26,16 @@ pub fn state_dir_from(env_home: Option<OsString>, user_home: Option<PathBuf>) ->
     }
 }
 
+/// How long [`update_session`] waits for a session's lock before giving up.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+/// Sleep between lock attempts.
+const LOCK_POLL: Duration = Duration::from_millis(15);
+
 /// Read-modify-writes one session under an exclusive lock on
 /// `<dir>/sessions/<provider>__<key>.lock`. A missing or corrupt file reads
-/// as `None`; returning `None` removes the session file.
+/// as `None`; any other read error is returned and `f` is not called.
+/// Returning `None` removes the session file. If the lock is not acquired
+/// within 2 s, returns an error of kind `TimedOut`.
 pub fn update_session(
     dir: &Path,
     provider: &str,
@@ -47,7 +55,7 @@ pub fn list_sessions(dir: &Path) -> Vec<SessionState> {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
-        .filter_map(|p| read_state(&p))
+        .filter_map(|p| read_state(&p).ok().flatten())
         .collect()
 }
 
@@ -86,9 +94,9 @@ fn update_stem(
         .truncate(false)
         .write(true)
         .open(sessions.join(format!("{stem}.lock")))?;
-    lock.lock()?;
+    lock_bounded(&lock)?;
     let path = sessions.join(format!("{stem}.json"));
-    match f(read_state(&path)) {
+    match f(read_state(&path)?) {
         Some(state) => write_atomic(&sessions, stem, &path, &state),
         None => match fs::remove_file(&path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -98,9 +106,35 @@ fn update_stem(
     // `lock` drops here, releasing the lock.
 }
 
-/// Rejects stems that could escape the sessions dir.
+/// Takes an exclusive lock on `file`, retrying until [`LOCK_TIMEOUT`].
+fn lock_bounded(file: &File) -> io::Result<()> {
+    let deadline = Instant::now() + LOCK_TIMEOUT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::Error(e)) => return Err(e),
+            Err(TryLockError::WouldBlock) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for session lock",
+                    ));
+                }
+                std::thread::sleep(LOCK_POLL.min(deadline - now));
+            }
+        }
+    }
+}
+
+/// Accepts only non-empty stems of `[A-Za-z0-9_-]`, so a stem can never
+/// name a path outside the sessions dir on any platform.
 fn check_stem(stem: &str) -> io::Result<()> {
-    if stem.is_empty() || stem.contains(['/', '\\']) || stem.contains("..") {
+    let ok = !stem.is_empty()
+        && stem
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !ok {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("invalid session key: {stem:?}"),
@@ -109,9 +143,14 @@ fn check_stem(stem: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn read_state(path: &Path) -> Option<SessionState> {
-    let bytes = fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+/// `Ok(None)` for a missing or unparsable file; other I/O errors propagate.
+fn read_state(path: &Path) -> io::Result<Option<SessionState>> {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Ok(serde_json::from_slice(&bytes).ok())
 }
 
 /// Writes `state` to a unique temp file in `sessions`, then renames it over
@@ -287,10 +326,52 @@ mod tests {
     #[test]
     fn mark_seen_rejects_escaping_keys() {
         let tmp = tempfile::tempdir().unwrap();
-        for bad in ["../x", "a/b", "a\\b", "..", ""] {
+        for bad in ["../x", "a/b", "a\\b", "..", "", "C:x", "a:b", "a.b", "a b", "a\0b"] {
             let err = mark_seen(tmp.path(), bad, 1).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad}");
         }
+    }
+
+    #[test]
+    fn held_lock_times_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let sessions = dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let holder = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(sessions.join("claude__held.lock"))
+            .unwrap();
+        holder.lock().unwrap();
+        let start = std::time::Instant::now();
+        let err = update_session(dir, "claude", "held", |_| Some(state("claude", "held"))).unwrap_err();
+        let waited = start.elapsed();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(waited >= std::time::Duration::from_millis(1900), "{waited:?}");
+        assert!(waited < std::time::Duration::from_secs(3), "{waited:?}");
+        assert!(!json_path(dir, "claude__held").exists());
+        // Once released, the session can be written again.
+        drop(holder);
+        update_session(dir, "claude", "held", |_| Some(state("claude", "held"))).unwrap();
+    }
+
+    #[test]
+    fn read_error_propagates_without_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // A directory where the session file should be makes the read fail
+        // with an error other than NotFound.
+        fs::create_dir_all(json_path(dir, "claude__s1")).unwrap();
+        let mut called = false;
+        let err = update_session(dir, "claude", "s1", |_| {
+            called = true;
+            Some(state("claude", "s1"))
+        });
+        assert!(err.is_err());
+        assert!(!called, "f must not run after a read error");
+        assert!(json_path(dir, "claude__s1").is_dir());
     }
 
     #[test]
