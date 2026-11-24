@@ -37,7 +37,7 @@ Agent Pin pulls that state out of the terminals and into one small window that s
    ```
 
    Hooks are only installed for agents whose config directory already exists (`~/.claude` for Claude Code, `~/.codex` for Codex). They are merged into `~/.claude/settings.json` and `~/.codex/hooks.json`.
-3. **Claude Code:** run `/hooks` to review and trust the new hooks. **Codex:** restart it, since it only loads hooks at session start, and run `/hooks` to trust the new hooks.
+3. **Claude Code:** run `/hooks` to review and trust the new hooks. **Codex:** run `/hooks` to trust the new hooks.
 
 The installer is careful with your config. It backs the file up to `<file>.agent-pin-backup-<timestamp>` before writing, writes atomically, keeps your key order, never removes a hook it didn't install, and skips the write entirely when nothing would change. Re-running it is safe.
 
