@@ -57,8 +57,8 @@ pub fn hook_command(exe: &Path, provider: &str, event: &str) -> String {
 
 /// True for commands agent-pin installed: the legacy Ruby `agent-pin-status`
 /// script, an `agent-pin` binary invoked with the `hook` subcommand, or a
-/// command of exactly the [`hook_command`] shape whose quoted exe is named
-/// like Agent Pin in any case or separator style (an AppImage is named
+/// command of exactly the [`hook_command`] shape whose quoted exe name
+/// starts with Agent Pin in any case or separator style (an AppImage is named
 /// `Agent Pin_<version>_<arch>.AppImage`).
 pub fn is_agent_pin_command(cmd: &str) -> bool {
     cmd.contains("agent-pin-status")
@@ -70,7 +70,7 @@ pub fn is_agent_pin_command(cmd: &str) -> bool {
                 .filter(|c| !matches!(c, ' ' | '_' | '-' | '.'))
                 .flat_map(char::to_lowercase)
                 .collect();
-            squashed.contains("agentpin")
+            squashed.starts_with("agentpin")
         })
 }
 
@@ -502,6 +502,19 @@ mod tests {
         assert!(!is_agent_pin_command("\"/h/Agent Pin.AppImage\" hook claude Stop --x"));
         assert!(!is_agent_pin_command("\"/h/Agent Pin/other\" hook claude Stop"));
         assert!(!is_agent_pin_command("/h/AgentPin hook claude Stop"));
+    }
+
+    /// A user's own tool whose name merely contains "agentpin" is not ours
+    /// and survives a merge.
+    #[test]
+    fn user_exe_containing_agentpin_is_not_ours() {
+        let user = "\"/x/MagentPinger\" hook a b";
+        assert!(!is_agent_pin_command(user));
+        let mut config = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": user}]}]}
+        });
+        merge(&mut config, claude(), &exe());
+        assert!(commands(&config, "Stop").contains(&user.to_string()), "{config}");
     }
 
     #[test]

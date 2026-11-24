@@ -71,14 +71,16 @@ pub fn mark_seen(dir: &Path, row_key: &str, now_ms: i64) -> io::Result<()> {
     })
 }
 
-/// Removes `<dir>/sessions` and everything in it.
 /// Deletes stale files in `<dir>/sessions`, returning how many went:
 /// - session `*.json` files whose `updated_ms` is older than `max_age_ms`
 ///   before `now_ms` (unparseable ones go by file mtime), together with their
-///   lock file, all under the session's lock (bounded, as for writers); a
-///   session whose lock stays busy is skipped;
-/// - `*.json.tmp-*` files and orphan `*.lock` files (no session file) whose
-///   mtime is older than `max_age_ms`; a lock someone holds is kept.
+///   lock file on Unix, all under the session's lock (bounded, as for
+///   writers); a session whose lock stays busy is skipped;
+/// - `*.json.tmp-*` files whose mtime is older than `max_age_ms`;
+/// - on Unix only, orphan `*.lock` files (no session file) whose mtime is
+///   older than `max_age_ms`; a lock someone holds is kept.
+///
+/// Lock files are never deleted on Windows (see [`prune_session`]).
 ///
 /// mtime ages are measured against the system clock. Per-file errors are
 /// skipped; only failing to list the directory is an error.
@@ -104,9 +106,12 @@ pub fn prune(dir: &Path, now_ms: i64, max_age_ms: i64) -> io::Result<usize> {
                 removed += 1;
             }
         } else if let Some(stem) = name.strip_suffix(".lock") {
+            #[cfg(unix)]
             if prune_orphan_lock(&sessions, stem, &path, max_age) {
                 removed += 1;
             }
+            #[cfg(not(unix))]
+            let _ = stem;
         }
     }
     Ok(removed)
@@ -132,14 +137,22 @@ fn prune_session(
         return Ok(0);
     }
     fs::remove_file(&path)?;
-    // Writers waiting on this lock file notice it was unlinked and relock.
+    // Unix only: writers waiting on this lock file see (by dev and inode)
+    // that it was unlinked and relock. On Windows `still_linked` can only
+    // check that the path exists, so a waiter could keep the old lock while
+    // another writer locks a new file at the same path; there the 0-byte
+    // lock file is left in place.
+    #[cfg(unix)]
     let lock_gone = fs::remove_file(&lock_path).is_ok();
+    #[cfg(not(unix))]
+    let lock_gone = false;
     drop(lock);
     Ok(1 + usize::from(lock_gone))
 }
 
 /// Removes a lock file with no session file beside it, if it is old and
-/// nobody holds it.
+/// nobody holds it. Unix only, for the reason given in [`prune_session`].
+#[cfg(unix)]
 fn prune_orphan_lock(sessions: &Path, stem: &str, path: &Path, max_age: Duration) -> bool {
     if check_stem(stem).is_err()
         || sessions.join(format!("{stem}.json")).exists()
@@ -169,6 +182,7 @@ fn older_than(path: &Path, max_age: Duration) -> bool {
         .is_some_and(|age| age > max_age)
 }
 
+/// Removes `<dir>/sessions` and everything in it.
 pub fn reset(dir: &Path) -> io::Result<()> {
     match fs::remove_dir_all(dir.join("sessions")) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -198,9 +212,9 @@ fn update_stem(
 
 /// Opens (creating if needed) and exclusively locks the lock file at
 /// `path`, retrying until [`LOCK_TIMEOUT`]. Only [`prune`] deletes lock files,
-/// and only while holding them; a caller that then wins the unlinked file
-/// sees it is no longer at `path` and locks the current file instead, so two
-/// writers never hold different lock files for one session.
+/// only on Unix, and only while holding them; a caller that then wins the
+/// unlinked file sees it is no longer at `path` and locks the current file
+/// instead, so two writers never hold different lock files for one session.
 fn lock_session(path: &Path) -> io::Result<File> {
     let deadline = Instant::now() + LOCK_TIMEOUT;
     loop {
@@ -526,6 +540,7 @@ mod tests {
         names
     }
 
+    #[cfg(unix)]
     #[test]
     fn prune_removes_old_sessions_and_keeps_fresh() {
         let tmp = tempfile::tempdir().unwrap();
@@ -552,6 +567,7 @@ mod tests {
         assert!(sessions.join("claude__newbad.json").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn prune_removes_orphan_tmp_and_lock_files() {
         let tmp = tempfile::tempdir().unwrap();
@@ -576,6 +592,7 @@ mod tests {
         assert_eq!(prune(&dir.join("nope"), 10 * DAY, 3 * DAY).unwrap(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn prune_skips_a_session_whose_lock_is_held() {
         let tmp = tempfile::tempdir().unwrap();
@@ -590,6 +607,21 @@ mod tests {
         assert!(json_path(dir, "claude__busy").exists());
         drop(holder);
         assert_eq!(prune(dir, 10 * DAY, 3 * DAY).unwrap(), 2);
+    }
+
+    /// On Windows prune deletes stale session files but never lock files.
+    #[cfg(windows)]
+    #[test]
+    fn prune_keeps_lock_files_on_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = 10 * DAY;
+        put(dir, "old", now - 3 * DAY - 1);
+        let sessions = dir.join("sessions");
+        fs::write(sessions.join("claude__orphan.lock"), b"").unwrap();
+        set_age(&sessions.join("claude__orphan.lock"), Duration::from_secs(4 * 86_400));
+        assert_eq!(prune(dir, now, 3 * DAY).unwrap(), 1, "only the old json");
+        assert_eq!(names(dir), ["claude__old.lock", "claude__orphan.lock"]);
     }
 
     /// A writer that was waiting on a lock file prune then deleted must not
