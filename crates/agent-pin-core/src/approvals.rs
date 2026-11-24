@@ -23,6 +23,11 @@ use crate::store::{check_stem, older_than, publish_new, write_bytes_atomic};
 pub const POLL_MS: u64 = 200;
 /// `app.alive` this old or older means the app is not running.
 pub const ALIVE_MAX_AGE_MS: i64 = 3000;
+/// A request file whose mtime is older than this has no live hook behind
+/// it: a waiting hook refreshes it every [`POLL_MS`].
+pub const HOOK_STALE_MS: i64 = 3000;
+/// The app's liveness file in the state dir.
+pub const ALIVE_FILE: &str = "app.alive";
 /// How long a request waits for a decision.
 pub const WAIT_MS: i64 = 590_000;
 
@@ -93,14 +98,34 @@ fn dec_path(dir: &Path, id: &str) -> PathBuf {
 pub fn write_alive(dir: &Path, now_ms: i64) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     let body = format!("{now_ms} {}", std::process::id());
-    write_bytes_atomic(dir, "app.alive", &dir.join("app.alive"), body.as_bytes())
+    write_bytes_atomic(dir, ALIVE_FILE, &dir.join(ALIVE_FILE), body.as_bytes())
+}
+
+/// Removes `<dir>/app.alive` only when it records this process's pid, so
+/// an exiting instance never removes another running instance's file. A
+/// missing or unparsable file is left alone and is not an error.
+pub fn remove_alive(dir: &Path) -> io::Result<()> {
+    let path = dir.join(ALIVE_FILE);
+    let body = match fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let pid = body.split_whitespace().nth(1).and_then(|p| p.parse::<u32>().ok());
+    if pid != Some(std::process::id()) {
+        return Ok(());
+    }
+    match fs::remove_file(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
 }
 
 /// True when `app.alive` holds a timestamp less than [`ALIVE_MAX_AGE_MS`]
 /// from `now_ms` (either way, so a stale file with a future stamp from a
 /// clock jump does not count as alive forever).
 pub fn app_alive(dir: &Path, now_ms: i64) -> bool {
-    let Ok(body) = fs::read_to_string(dir.join("app.alive")) else {
+    let Ok(body) = fs::read_to_string(dir.join(ALIVE_FILE)) else {
         return false;
     };
     body.split_whitespace()
@@ -254,7 +279,9 @@ pub fn post(dir: &Path, r: &Request) -> io::Result<Posted> {
 
 /// Every valid, unexpired request, oldest first. Also sweeps
 /// `<dir>/approvals`, best effort:
-/// - expired requests (`deadline_ms` passed), with any decision file;
+/// - expired requests (`deadline_ms` passed), and requests whose file mtime
+///   is more than [`HOOK_STALE_MS`] old (their hook is gone, e.g. killed
+///   after the user answered in the terminal), each with any decision file;
 /// - request files whose content `id` is not their file stem, and ones
 ///   that do not parse once they are 5 s old (a younger one may still be
 ///   being written);
@@ -282,7 +309,9 @@ pub fn list_pending(dir: &Path, now_ms: i64) -> Vec<Request> {
             };
             match serde_json::from_slice::<Request>(&bytes) {
                 Ok(r) if r.id == stem && check_stem(stem).is_ok() => {
-                    if now_ms < r.deadline_ms {
+                    let hook_gone =
+                        older_than(&path, Duration::from_millis(HOOK_STALE_MS as u64));
+                    if now_ms < r.deadline_ms && !hook_gone {
                         out.push(r);
                     } else {
                         remove_files(dir, stem);
@@ -310,21 +339,31 @@ pub fn list_pending(dir: &Path, now_ms: i64) -> Vec<Request> {
     out
 }
 
-/// Splits `pending` into the requests whose session row
-/// (`<provider>__<session_key>`) is in `rows` with status WaitingApproval,
-/// in their original order, and the ids of the rest, which no longer need a
-/// decision (the user answered in the terminal, or the session moved on).
+/// Decides which pending requests the overlay shows, by their session row
+/// (`<provider>__<session_key>`). Returns `(keep, delete)`:
+/// - row WaitingApproval or Running: kept. Running still counts because
+///   subagents and parallel tool calls report under the parent's session
+///   and can flip the row to Running while the request is live;
+/// - row Completed, Idle or Error: its id is returned to delete, as the
+///   session has moved on;
+/// - no row (hidden, or a transient read failure): in neither list, so it
+///   is hidden but not deleted.
 ///
-/// The caller must list the requests before it builds `rows`: the hook marks
-/// its row waiting before it posts, so a request listed first always finds
-/// its row waiting unless the session has since moved on.
+/// Rows are not what dismisses a request whose hook has gone: the hook
+/// refreshes its request file's mtime while it waits, and [`list_pending`]
+/// deletes requests it has stopped refreshing ([`HOOK_STALE_MS`]).
 pub fn pending_for_rows(pending: Vec<Request>, rows: &[Row]) -> (Vec<Request>, Vec<String>) {
-    let waiting = |r: &Request| {
+    let mut keep = Vec::new();
+    let mut delete = Vec::new();
+    for r in pending {
         let key = format!("{}__{}", r.provider, r.session_key);
-        rows.iter().any(|row| row.key == key && row.status == Status::WaitingApproval)
-    };
-    let (keep, stale): (Vec<Request>, Vec<Request>) = pending.into_iter().partition(waiting);
-    (keep, stale.into_iter().map(|r| r.id).collect())
+        match rows.iter().find(|row| row.key == key).map(|row| row.status) {
+            Some(Status::WaitingApproval | Status::Running) => keep.push(r),
+            Some(Status::Completed | Status::Idle | Status::Error) => delete.push(r.id),
+            None => {}
+        }
+    }
+    (keep, delete)
 }
 
 /// Removes the request and decision files for each id, best effort. Ids
@@ -388,7 +427,10 @@ impl Drop for Cleanup<'_> {
 
 /// Waits for the decision on the posted request, polling every [`POLL_MS`] with the
 /// injected clock and sleep. Each poll first reads the decision file, then
-/// gives up at its `deadline_ms` or as soon as the app is not alive. A
+/// gives up if its own request file is gone (the app dismissed it), else
+/// refreshes the request file's mtime so the app knows this hook is still
+/// waiting (see [`HOOK_STALE_MS`]), then gives up at its `deadline_ms` or
+/// as soon as the app is not alive. A
 /// decision file that is not exactly an allow or deny yields `None`.
 /// Removes the request and decision files before returning.
 pub fn wait(
@@ -401,6 +443,7 @@ pub fn wait(
     let _cleanup = Cleanup { dir, id: &r.id };
     check_stem(&r.id).ok()?;
     let dec = dec_path(dir, &r.id);
+    let req = req_path(dir, &r.id);
     loop {
         match fs::read(&dec) {
             Ok(bytes) => {
@@ -411,6 +454,13 @@ pub fn wait(
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(_) => return None,
         }
+        if fs::symlink_metadata(&req).is_err() {
+            return None;
+        }
+        let _ = fs::File::options()
+            .write(true)
+            .open(&req)
+            .and_then(|f| f.set_modified(SystemTime::now()));
         let t = now();
         if t >= r.deadline_ms || !app_alive(dir, t) {
             return None;
@@ -950,12 +1000,14 @@ mod tests {
     }
 
     #[test]
-    fn pending_for_rows_keeps_only_waiting_sessions() {
+    fn pending_for_rows_keeps_waiting_and_running_drops_ended_hides_missing() {
         use crate::session::Status;
         let rows = [
             row("claude__wait", Status::WaitingApproval),
             row("claude__run", Status::Running),
             row("claude__done", Status::Completed),
+            row("claude__idle", Status::Idle),
+            row("claude__err", Status::Error),
             row("codex__wait", Status::WaitingApproval),
         ];
         let pending = vec![
@@ -964,24 +1016,107 @@ mod tests {
             req("claude", "done", 3),
             req("claude", "gone", 4),
             req("codex", "wait", 5),
-            req("claude", "wait", 6),
+            req("claude", "idle", 6),
+            req("claude", "err", 7),
+            req("claude", "wait", 8),
         ];
         let (keep, drop) = pending_for_rows(pending, &rows);
         let kept: Vec<&str> = keep.iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(kept, ["claude__wait__1", "codex__wait__5", "claude__wait__6"]);
-        assert_eq!(drop, ["claude__run__2", "claude__done__3", "claude__gone__4"]);
+        // A Running row may be a subagent or parallel tool call reporting
+        // under the parent's session while the request is still live.
+        assert_eq!(kept, ["claude__wait__1", "claude__run__2", "codex__wait__5", "claude__wait__8"]);
+        // A missing row (gone__4) is neither kept nor deleted.
+        assert_eq!(drop, ["claude__done__3", "claude__idle__6", "claude__err__7"]);
     }
 
     #[test]
     fn pending_for_rows_matches_provider_and_key_exactly() {
         use crate::session::Status;
-        // Same session key under another provider is a different session.
-        let rows = [row("codex__s1", Status::WaitingApproval)];
+        // Same session key under another provider is a different session,
+        // so claude__s1 has no row: hidden, not deleted.
+        let rows = [row("codex__s1", Status::Completed)];
         let (keep, drop) = pending_for_rows(vec![req("claude", "s1", 1)], &rows);
+        assert!(keep.is_empty() && drop.is_empty());
+        let (keep, drop) = pending_for_rows(vec![req("codex", "s1", 2)], &rows);
         assert!(keep.is_empty());
-        assert_eq!(drop, ["claude__s1__1"]);
+        assert_eq!(drop, ["codex__s1__2"]);
         let (keep, drop) = pending_for_rows(Vec::new(), &rows);
         assert!(keep.is_empty() && drop.is_empty());
+    }
+
+    #[test]
+    fn wait_returns_none_when_request_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_alive(dir, T0).unwrap();
+        let r = new_request("claude", "s1", &bash("ls"), T0);
+        let posted = post(dir, &r).unwrap();
+        let path = req_path(dir, &r.id);
+        let (got, sleeps) = run_wait(dir, posted, T0, true, |_| {
+            let _ = fs::remove_file(&path);
+        });
+        assert_eq!((got, sleeps), (None, 1));
+        assert!(!dec_path(dir, &r.id).exists());
+    }
+
+    #[test]
+    fn wait_refreshes_request_mtime_each_poll() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_alive(dir, T0).unwrap();
+        let r = new_request("claude", "s1", &bash("ls"), T0);
+        let posted = post(dir, &r).unwrap();
+        let path = req_path(dir, &r.id);
+        let id = r.id.clone();
+        let mut polls = 0;
+        let (got, _) = run_wait(dir, posted, T0, true, |_| {
+            polls += 1;
+            if polls > 1 {
+                // The poll after the last sleep refreshed the mtime.
+                assert!(!older_than(&path, Duration::from_secs(2)), "poll {polls}");
+            }
+            if polls == 3 {
+                decide(dir, &id, Behavior::Allow).unwrap();
+            } else {
+                set_age(&path, Duration::from_secs(10));
+            }
+        });
+        assert_eq!(got, Some(Behavior::Allow));
+        assert_eq!(polls, 3);
+    }
+
+    #[test]
+    fn list_pending_deletes_request_whose_hook_stopped_refreshing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let live = new_request("claude", "s1", &bash("ls"), T0);
+        let dead = new_request("claude", "s2", &bash("ls"), T0);
+        post(dir, &live).unwrap();
+        post(dir, &dead).unwrap();
+        decide(dir, &dead.id, Behavior::Allow).unwrap();
+        set_age(&req_path(dir, &live.id), Duration::from_millis(HOOK_STALE_MS as u64 - 1000));
+        set_age(&req_path(dir, &dead.id), Duration::from_millis(HOOK_STALE_MS as u64 + 1000));
+        assert_eq!(list_pending(dir, T0), vec![live.clone()]);
+        assert!(!req_path(dir, &dead.id).exists());
+        assert!(!dec_path(dir, &dead.id).exists());
+        assert!(req_path(dir, &live.id).exists());
+    }
+
+    #[test]
+    fn remove_alive_only_removes_own_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        remove_alive(dir).unwrap();
+        write_alive(dir, T0).unwrap();
+        remove_alive(dir).unwrap();
+        assert!(!dir.join(ALIVE_FILE).exists());
+        let other = std::process::id().wrapping_add(1);
+        fs::write(dir.join(ALIVE_FILE), format!("{T0} {other}")).unwrap();
+        remove_alive(dir).unwrap();
+        assert!(dir.join(ALIVE_FILE).exists(), "another instance's file stays");
+        fs::write(dir.join(ALIVE_FILE), "garbage").unwrap();
+        remove_alive(dir).unwrap();
+        assert!(dir.join(ALIVE_FILE).exists());
     }
 
     #[test]

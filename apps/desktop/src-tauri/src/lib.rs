@@ -77,23 +77,28 @@ fn read_integrations() -> Integrations {
     }
 }
 
-/// Pending approval requests whose session is still waiting for approval,
-/// oldest first. Deletes the request files of the rest, best effort: their
-/// session has moved on (e.g. the user answered in the terminal).
+/// Pending approval requests to show, oldest first. Dismissal rules:
+/// - `list_pending` deletes expired requests and ones whose hook stopped
+///   refreshing the request file (the hook is gone, e.g. killed after the
+///   user answered in the terminal);
+/// - of the rest, a request whose session row is WaitingApproval or Running
+///   is shown; one whose row is Completed, Idle or Error is deleted, best
+///   effort; one with no row is hidden but kept.
+///
+/// See `approvals::pending_for_rows`.
 #[tauri::command]
 fn read_approvals() -> Vec<Request> {
     let Some(dir) = store::state_dir() else {
         return Vec::new();
     };
     let now = now_ms();
-    // Requests before rows: see `approvals::pending_for_rows`.
     let pending = approvals::list_pending(&dir, now);
     if pending.is_empty() {
         return pending;
     }
     let rows = build_rows(&store::list_sessions(&dir), now);
-    let (keep, stale) = approvals::pending_for_rows(pending, &rows);
-    approvals::remove(&dir, &stale);
+    let (keep, ended) = approvals::pending_for_rows(pending, &rows);
+    approvals::remove(&dir, &ended);
     keep
 }
 
@@ -274,13 +279,14 @@ fn spawn_heartbeat() {
     });
 }
 
-/// Stops the heartbeat and removes `app.alive`, best effort, so waiting
-/// hooks give up at once instead of after the file goes stale.
+/// Stops the heartbeat and removes `app.alive` if this process wrote it,
+/// best effort, so waiting hooks give up at once instead of after the file
+/// goes stale. Another instance's file is left alone.
 fn stop_heartbeat() {
     let mut stopped = HEARTBEAT_STOPPED.lock().unwrap_or_else(|e| e.into_inner());
     *stopped = true;
     if let Some(dir) = store::state_dir() {
-        let _ = std::fs::remove_file(dir.join("app.alive"));
+        let _ = approvals::remove_alive(&dir);
     }
 }
 
