@@ -14,9 +14,11 @@ use crate::store::update_session;
 pub const STDIN_MAX: u64 = 1 << 20;
 
 /// Runs one hook event. `args` is `[provider, event_name]`; `stdin` is the
-/// hook's JSON payload. Payloads over 1 MB keep only `session_id` and `cwd`
-/// (salvaged from the prefix) so the status still moves; without a
-/// salvageable `session_id` the event is skipped. The caller bounds how
+/// hook's JSON payload. A payload that is not a complete JSON object (empty,
+/// truncated, garbage, or over 1 MB) keeps only `session_id` and `cwd`
+/// salvaged from its raw bytes so the status still moves; without a
+/// salvageable `session_id` the event is skipped. The `default` session key
+/// is used only for a valid JSON object with no `session_id`. The caller bounds how
 /// long reading `stdin` can take. Errors are returned, never panicked.
 pub fn run_hook(
     args: &[String],
@@ -40,18 +42,28 @@ pub fn run_hook(
     let dir = state_dir.ok_or("no state directory: set AGENT_PIN_HOME or the home directory")?;
     let provider = normalize_provider(provider);
     let kind = HookKind::parse(event);
-    let input = if oversized {
+    if oversized {
         raw.truncate(STDIN_MAX as usize);
-        let Some(session_id) = salvage_string(&raw, "session_id") else {
-            return Ok(());
-        };
-        HookInput {
-            session_id: Some(session_id),
-            cwd: salvage_string(&raw, "cwd"),
-            ..HookInput::default()
-        }
+    }
+    let parsed = if oversized {
+        None
     } else {
-        HookInput::from_json_lossy(&String::from_utf8_lossy(&raw))
+        HookInput::from_json(&String::from_utf8_lossy(&raw))
+    };
+    let input = match parsed {
+        Some(input) => input,
+        // Not a complete JSON object (empty, truncated, garbage or too
+        // big): salvage session_id and cwd, or record nothing.
+        None => {
+            let Some(session_id) = salvage_string(&raw, "session_id") else {
+                return Ok(());
+            };
+            HookInput {
+                session_id: Some(session_id),
+                cwd: salvage_string(&raw, "cwd"),
+                ..HookInput::default()
+            }
+        }
     };
     let key = session_key(&input);
     update_session(&dir, &provider, &key, |prev| apply(prev, &provider, kind, &input, now_ms))
@@ -140,19 +152,52 @@ mod tests {
         assert!(run_hook(&args("claude", "Stop"), &b"{}"[..], None, 1).is_err());
     }
 
+    fn json_count(dir: &Path) -> usize {
+        fs::read_dir(dir.join("sessions"))
+            .map(|rd| rd.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "json")).count())
+            .unwrap_or(0)
+    }
+
     #[test]
-    fn garbage_stdin_still_writes_default_session() {
+    fn garbage_stdin_writes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         let garbage: &[u8] = b"\xff\xfe not json {{{";
         run_hook(&args("codex", "SessionStart"), garbage, Some(dir.clone()), 5).unwrap();
-        assert!(session_file(&dir, "codex__default").is_file());
-        // Empty stdin works the same way.
+        // Empty stdin (e.g. a reader timeout) records nothing either.
         run_hook(&args("codex", "Stop"), &b""[..], Some(dir.clone()), 6).unwrap();
+        assert_eq!(json_count(&dir), 0);
+        assert!(!session_file(&dir, "codex__default").exists());
+    }
+
+    #[test]
+    fn valid_json_without_session_id_uses_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        run_hook(&args("codex", "Stop"), &br#"{"cwd":"/repo"}"#[..], Some(dir.clone()), 7).unwrap();
         let all = list_sessions(&dir);
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].session_key, "default");
-        assert_eq!(all[0].updated_ms, 6);
+        assert_eq!(all[0].cwd.as_deref(), Some("/repo"));
+        assert_eq!(all[0].updated_ms, 7);
+    }
+
+    #[test]
+    fn partial_json_salvages_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let start = br#"{"session_id":"s1","cwd":"/repo"}"#;
+        run_hook(&args("claude", "PermissionRequest"), &start[..], Some(dir.clone()), 1).unwrap();
+        // Truncated mid-payload, well under 1 MB.
+        let partial = br#"{"session_id":"s1","cwd":"/repo","tool_name":"Bash","tool_input":{"command":"ca"#;
+        run_hook(&args("claude", "PostToolUse"), &partial[..], Some(dir.clone()), 2).unwrap();
+        assert!(!session_file(&dir, "claude__default").exists());
+        let all = list_sessions(&dir);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].session_key, "s1");
+        assert_eq!(all[0].status, Status::Running);
+        assert_eq!(all[0].updated_ms, 2);
+        assert_eq!(all[0].cwd.as_deref(), Some("/repo"));
     }
 
     /// A payload of more than 1 MB: `head` then a huge `tool_response`.

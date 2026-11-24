@@ -51,21 +51,28 @@ impl HookInput {
     /// Parses a hook payload. Never fails: empty, invalid or non-object
     /// input, and fields of the wrong type, all yield `None`.
     pub fn from_json_lossy(raw: &str) -> HookInput {
+        HookInput::from_json(raw).unwrap_or_default()
+    }
+
+    /// Parses a hook payload that must be a JSON object; anything else
+    /// (empty, truncated, invalid, or a non-object) is `None`. Fields of the
+    /// wrong type still yield `None` fields.
+    pub fn from_json(raw: &str) -> Option<HookInput> {
         let root = match serde_json::from_str::<Value>(raw) {
             Ok(Value::Object(map)) => map,
-            _ => return HookInput::default(),
+            _ => return None,
         };
         let text = |v: Option<&Value>| v.and_then(Value::as_str).map(str::to_owned);
         let tool_input = root.get("tool_input");
         let tool_field = |key: &str| text(tool_input.and_then(|t| t.get(key)));
-        HookInput {
+        Some(HookInput {
             session_id: text(root.get("session_id")),
             cwd: text(root.get("cwd")),
             prompt: text(root.get("prompt")),
             tool_name: text(root.get("tool_name")),
             file_path: tool_field("file_path").or_else(|| tool_field("notebook_path")),
             command: tool_field("command"),
-        }
+        })
     }
 }
 

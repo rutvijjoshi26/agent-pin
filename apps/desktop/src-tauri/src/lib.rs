@@ -103,7 +103,10 @@ fn start_window_drag(window: WebviewWindow) -> Result<(), String> {
 /// `install-hooks` CLI subcommand.
 pub fn install_hooks() -> Result<Vec<String>, String> {
     let home = home_dir().ok_or(NO_HOME)?;
-    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let exe = match appimage_path() {
+        Some(path) => path,
+        None => std::env::current_exe().map_err(|error| error.to_string())?,
+    };
     validate_install_exe_path(&exe)?;
     install::install(&home, &exe, now_ms() / 1000)
 }
@@ -121,6 +124,17 @@ fn home_dir() -> Option<PathBuf> {
     let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     std::env::var_os(var)
         .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+/// On Linux, the AppImage file itself (`APPIMAGE`), since `current_exe` is a
+/// temporary mount that vanishes when the app quits.
+fn appimage_path() -> Option<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    std::env::var_os("APPIMAGE")
+        .filter(|path| !path.is_empty())
         .map(PathBuf::from)
 }
 
