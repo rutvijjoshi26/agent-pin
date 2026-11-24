@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "ruby ~/.agent-pin/bin/agent-pin-status claude running session-start" }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          { "type": "command", "command": "ruby ~/.agent-pin/bin/agent-pin-status claude waiting notify" },
+          { "type": "command", "command": "notify-send 'Claude needs you'" }
+        ]
+      }
+    ]
+  }
+}

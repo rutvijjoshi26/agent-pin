@@ -1,0 +1,96 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/agent-pin-core
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Core tests
+        run: cargo test --manifest-path crates/agent-pin-core/Cargo.toml
+
+      - name: Core clippy
+        run: cargo clippy --manifest-path crates/agent-pin-core/Cargo.toml --all-targets -- -D warnings
+
+      # Glob instead of a bare directory: Node 22's --test treats arguments as
+      # glob patterns, and bash expands this one on every OS.
+      - name: Web tests
+        run: node --test apps/desktop/web/*.test.js
+
+  app-check:
+    name: App check ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - macos-latest
+          - windows-latest
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          # AppImage bundling runs linuxdeploy, which needs FUSE 2 and `file`.
+          sudo apt-get install -y libfuse2 file
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      # frontendDist is the static ../web directory, so no npm build is needed.
+      - name: Check app crate
+        run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml

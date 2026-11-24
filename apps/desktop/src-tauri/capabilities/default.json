@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core defaults for the overlay window; dragging uses the start_window_drag command.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

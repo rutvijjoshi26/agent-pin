@@ -17,20 +17,20 @@ body {
   display: block;
 }
 
+/* The pin sizes to its content; a ResizeObserver fits the window to it. */
 .pin {
-  width: 100vw;
-  height: 100vh;
+  width: 220px;
   box-sizing: border-box;
   padding: 10px 12px;
   color: rgba(255, 255, 255, 0.92);
   background: rgba(0, 0, 0, 0.78);
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 8px;
-  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.26);
   user-select: none;
 }
 
 .pin.is-collapsed {
+  width: max-content;
   padding: 10px 9px;
 }
 
@@ -61,7 +61,13 @@ body {
 
 .agents {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 6px;
+}
+
+.session,
+.placeholder {
+  min-width: 0;
 }
 
 .setup {
@@ -105,9 +111,7 @@ body {
 
 .setup__detail {
   margin-top: 4px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
   font-size: 9px;
   line-height: 12px;
   color: rgba(255, 255, 255, 0.6);
@@ -125,6 +129,7 @@ body {
 }
 
 .agent__dot {
+  flex: none;
   display: inline-grid;
   place-items: center;
   width: 16px;
@@ -135,12 +140,58 @@ body {
   color: #050505;
 }
 
-.agent__initial {
-  width: 10px;
-  text-align: center;
-  font-size: 11px;
-  font-weight: 800;
-  color: rgba(255, 255, 255, 0.86);
+.agent[data-key] {
+  cursor: pointer;
+  border-radius: 5px;
+}
+
+.agent[data-key]:hover,
+.agent.is-open {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.agent__unseen {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: #4fa3ff;
+}
+
+.agent__collision {
+  margin: 2px 0 0 23px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 9px;
+  line-height: 12px;
+  font-weight: 700;
+  color: #f2ad33;
+}
+
+.card {
+  display: grid;
+  gap: 3px;
+  margin: 4px 0 2px 23px;
+  padding: 6px 7px;
+  border-left: 2px solid rgba(255, 255, 255, 0.18);
+  border-radius: 0 5px 5px 0;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.card__line {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  font-size: 10px;
+  line-height: 13px;
+  color: rgba(255, 255, 255, 0.82);
+}
+
+.card__line--empty {
+  color: rgba(255, 255, 255, 0.56);
 }
 
 .agent__body {
@@ -162,12 +213,14 @@ body {
 }
 
 .agent__name {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .agent__status {
+  flex: none;
   margin-left: auto;
 }
 
@@ -214,4 +267,8 @@ body {
 
 .is-error .agent__status {
   color: #e0333d;
+}
+
+.is-quiet .agent__status {
+  color: rgba(255, 255, 255, 0.56);
 }
