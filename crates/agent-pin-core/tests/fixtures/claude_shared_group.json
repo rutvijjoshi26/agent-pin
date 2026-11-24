@@ -1,0 +1,22 @@
+{
+  "model": "opus",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "/usr/local/bin/my-audit-hook --strict" },
+          { "type": "command", "command": "\"/Applications/Agent Pin.app/Contents/MacOS/agent-pin\" hook claude running tool" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"/Applications/Agent Pin.app/Contents/MacOS/agent-pin\" hook claude completed stop" }
+        ]
+      }
+    ]
+  },
+  "permissions": { "allow": ["Bash(ls:*)"] }
+}

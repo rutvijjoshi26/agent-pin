@@ -1,0 +1,5 @@
+{
+  "model": "sonnet",
+  "hooks": {},
+  "permissions": { "deny": [], "allow": [] }
+}

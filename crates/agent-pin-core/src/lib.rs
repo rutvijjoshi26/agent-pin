@@ -2,6 +2,7 @@
 //! per-session state machine and the on-disk session store.
 
 pub mod hook;
+pub mod install;
 pub mod input;
 pub mod rows;
 pub mod session;
