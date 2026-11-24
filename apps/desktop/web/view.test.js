@@ -18,6 +18,9 @@ import {
   collisionText,
   installedNote,
   isHeld,
+  lingeringNote,
+  onScrollbar,
+  SETTLED_NOTE_MS,
   pressHold,
   setupView,
   statusMeta
@@ -404,15 +407,54 @@ test("a failed decide says No longer pending and never success", () => {
   assert.deepEqual(decisionView(failed), { disabled: true, note: "No longer pending" });
 });
 
-test("pruneDecisions drops decisions whose request is gone", () => {
+test("pruneDecisions keeps a gone decision for 1.5 s, then drops it", () => {
   const a = req("claude", "s1", 1);
+  const goneId = "claude__gone__1__0123456789abcdef";
   const decisions = new Map([
-    [a.id, decisionStarted(true, NOW)],
-    ["claude__gone__1__0123456789abcdef", decisionFailed(decisionStarted(true, NOW), NOW + 1)]
+    [a.id, decisionStarted(true, NOW, "claude__s1")],
+    [goneId, decisionSent(decisionStarted(true, NOW, "claude__gone"), NOW + 1)]
   ]);
-  const pruned = pruneDecisions(decisions, [a], NOW + 10);
-  assert.deepEqual([...pruned.keys()], [a.id]);
-  assert.equal(pruneDecisions(decisions, undefined, NOW + 10).size, 0);
+  const first = pruneDecisions(decisions, [a], NOW + 10);
+  assert.deepEqual([...first.keys()], [a.id, goneId]);
+  assert.equal(first.get(a.id).goneMs, null);
+  assert.equal(first.get(goneId).goneMs, NOW + 10);
+  // The grace counts from when the request was first seen gone.
+  const later = pruneDecisions(first, [a], NOW + 1509);
+  assert.equal(later.get(goneId).goneMs, NOW + 10);
+  assert.deepEqual([...pruneDecisions(later, [a], NOW + 1510).keys()], [a.id]);
+  assert.equal(SETTLED_NOTE_MS, 1500);
+});
+
+test("a gone decision is never re-enabled and shows note-only", () => {
+  const sent = decisionSent(decisionStarted(false, NOW, "claude__s1"), NOW + 5);
+  const gone = pruneDecisions(new Map([["x", sent]]), [], NOW + 10);
+  assert.deepEqual(decisionView(gone.get("x")), { disabled: true, note: "Denied" });
+  assert.equal(lingeringNote("claude__s1", gone), "Denied");
+  assert.equal(lingeringNote("claude__s2", gone), null);
+  // While the request is still listed the strip shows it, not a lingering note.
+  const listed = pruneDecisions(new Map([["x", sent]]), [{ id: "x" }], NOW + 10);
+  assert.equal(lingeringNote("claude__s1", listed), null);
+  assert.equal(lingeringNote("claude__s1", new Map()), null);
+  const failed = pruneDecisions(
+    new Map([["y", decisionFailed(decisionStarted(true, NOW, "claude__s1"), NOW + 5)]]),
+    [],
+    NOW + 10
+  );
+  assert.equal(lingeringNote("claude__s1", failed), "No longer pending");
+});
+
+test("lingeringNote picks the newest gone decision for the row", () => {
+  const older = { ...decisionSent(decisionStarted(true, NOW, "k"), NOW + 1), goneMs: NOW + 2 };
+  const newer = { ...decisionSent(decisionStarted(false, NOW + 100, "k"), NOW + 101), goneMs: NOW + 102 };
+  assert.equal(lingeringNote("k", new Map([["a", older], ["b", newer]])), "Denied");
+  assert.equal(lingeringNote("k", new Map([["b", newer], ["a", older]])), "Denied");
+});
+
+test("onScrollbar: a press right of the client area is on the scrollbar", () => {
+  assert.equal(onScrollbar(100, 208), false);
+  assert.equal(onScrollbar(207.5, 208), false);
+  assert.equal(onScrollbar(208, 208), true);
+  assert.equal(onScrollbar(215, 208), true);
 });
 
 test("pruneDecisions keeps a decision, shown and disabled, while its request is listed", () => {
@@ -425,19 +467,24 @@ test("pruneDecisions keeps a decision, shown and disabled, while its request is 
     assert.equal(kept.size, 1);
     assert.deepEqual(decisionView(kept.get(a.id)), { disabled: true, note: "Denied" });
   }
-  assert.equal(pruneDecisions(sent, [], NOW + 101).size, 0);
+  assert.equal(pruneDecisions(sent, [], NOW + 101).size, 1);
 });
 
 test("pruneDecisions never re-enables a failed decide while its request is listed", () => {
   const a = req("claude", "s1", 1);
   const failed = new Map([[a.id, decisionFailed(decisionStarted(false, NOW), NOW + 100)]]);
   assert.equal(pruneDecisions(failed, [a], NOW + 10_000).size, 1);
-  assert.equal(pruneDecisions(failed, [], NOW + 10_000).size, 0);
+  const gone = pruneDecisions(failed, [], NOW + 10_000);
+  assert.equal(gone.size, 1);
+  assert.deepEqual(decisionView(gone.get(a.id)), { disabled: true, note: "No longer pending" });
+  assert.equal(pruneDecisions(gone, [], NOW + 11_500).size, 0);
 });
 
 test("pruneDecisions does not mutate its input", () => {
   const a = req("claude", "s1", 1);
   const decisions = new Map([[a.id, decisionStarted(true, NOW)]]);
   pruneDecisions(decisions, [], NOW);
+  pruneDecisions(decisions, [], NOW + 60_000);
   assert.equal(decisions.size, 1);
+  assert.equal(decisions.get(a.id).goneMs, null);
 });

@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use agent_pin_core::approvals::{self, Behavior, Request};
 use agent_pin_core::install::HookStatus;
 use agent_pin_core::rows::Row;
-use agent_pin_core::{build_rows, install, store};
+use agent_pin_core::{build_rows, install, layout, store};
 use serde::Serialize;
 use tauri::{LogicalSize, Manager, PhysicalPosition, Position, Size, WebviewWindow};
 
@@ -132,7 +132,9 @@ fn install_integrations() -> Result<Vec<String>, String> {
 }
 
 /// Resizes the window to the overlay's content. A window sitting in the right
-/// half of its monitor keeps its right edge fixed so it grows leftward.
+/// half of its monitor keeps its right edge fixed so it grows leftward. The
+/// height is capped at the monitor's work area and the window moves up to
+/// keep its bottom on it (see `layout::fit_rect`).
 #[tauri::command]
 fn fit_window(window: WebviewWindow, width: f64, height: f64) -> Result<(), String> {
     if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
@@ -142,7 +144,8 @@ fn fit_window(window: WebviewWindow, width: f64, height: f64) -> Result<(), Stri
     let scale = window.scale_factor().map_err(err)?;
     let position = window.outer_position().map_err(err)?;
     let old_width = window.inner_size().map_err(err)?.width as i32;
-    let anchor_right = match window.current_monitor().map_err(err)? {
+    let monitor = window.current_monitor().map_err(err)?;
+    let anchor_right = match &monitor {
         Some(monitor) => {
             let center = position.x + old_width / 2;
             center > monitor.position().x + monitor.size().width as i32 / 2
@@ -150,15 +153,33 @@ fn fit_window(window: WebviewWindow, width: f64, height: f64) -> Result<(), Stri
         None => false,
     };
 
+    // Cap the height at the monitor's work area and keep the bottom on it,
+    // so the content (and its Allow / Deny buttons) never runs off screen;
+    // the page scrolls when the height is capped.
+    let want_h = (height * scale).round() as i32;
+    let (area_y, area_h) = monitor
+        .as_ref()
+        .map(|monitor| {
+            let area = monitor.work_area();
+            (area.position.y, area.size.height as i32)
+        })
+        .unwrap_or((0, 0));
+    let (y, h) = layout::fit_rect(position.y, want_h, area_y, area_h);
+    let height = if h == want_h { height } else { f64::from(h) / scale };
+
     window
         .set_size(Size::Logical(LogicalSize::new(width, height)))
         .map_err(err)?;
 
     let new_width = (width * scale).round() as i32;
-    if anchor_right && new_width != old_width {
-        let x = position.x + old_width - new_width;
+    let x = if anchor_right && new_width != old_width {
+        position.x + old_width - new_width
+    } else {
+        position.x
+    };
+    if x != position.x || y != position.y {
         window
-            .set_position(Position::Physical(PhysicalPosition::new(x, position.y)))
+            .set_position(Position::Physical(PhysicalPosition::new(x, y)))
             .map_err(err)?;
     }
     Ok(())

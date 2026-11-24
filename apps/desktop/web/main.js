@@ -14,6 +14,8 @@ import {
   decisionView,
   installedNote,
   isHeld,
+  lingeringNote,
+  onScrollbar,
   pressHold,
   pruneDecisions,
   rowApproval,
@@ -64,7 +66,10 @@ pin.addEventListener("pointerdown", (event) => {
   if (event.button !== 0) {
     return;
   }
-  holdSince = pressHold(isInteractive(event.target), Date.now());
+  // A press on a scrollbar (the pin's, once the window is capped, or a
+  // detail box's) scrolls: it holds rebuilds and never starts a drag.
+  const interactive = isInteractive(event.target) || onScrollbarOf(event);
+  holdSince = pressHold(interactive, Date.now());
   if (holdSince !== null) {
     clearTimeout(holdTimer);
     holdTimer = setTimeout(releaseHold, HOLD_MAX_MS);
@@ -77,8 +82,13 @@ pin.addEventListener("pointerdown", (event) => {
   invoke("start_window_drag").catch((error) => console.warn("Unable to start window drag", error));
 });
 
+function onScrollbarOf(event) {
+  const target = event.target;
+  return target.scrollHeight > target.clientHeight && onScrollbar(event.offsetX, target.clientWidth);
+}
+
 pin.addEventListener("dblclick", (event) => {
-  if (isInteractive(event.target)) {
+  if (isInteractive(event.target) || onScrollbarOf(event)) {
     return;
   }
   expanded = !expanded;
@@ -121,7 +131,7 @@ function decideFrom(button) {
   for (const sibling of button.parentElement.querySelectorAll("button")) {
     sibling.disabled = true;
   }
-  decisions.set(id, decisionStarted(allow, Date.now()));
+  decisions.set(id, decisionStarted(allow, Date.now(), button.dataset.rowKey));
   renderRows(true);
   invoke("decide", { id, allow })
     .then(() => settle(id, decisionSent))
@@ -180,7 +190,11 @@ setupButton.addEventListener("click", async () => {
   }
 });
 
-new ResizeObserver(fitWindow).observe(pin);
+// Once the window is capped the pin stops growing, so watch its parts too.
+const resizes = new ResizeObserver(fitWindow);
+for (const node of [pin, agents, setup]) {
+  resizes.observe(node);
+}
 
 // Buttons and the approvals switch always take clicks; rows and cards only
 // while expanded, since the collapsed pin shows bare dots and is dragged or
@@ -189,10 +203,12 @@ function isInteractive(target) {
   return Boolean(target.closest("button, input, label") || (expanded && target.closest(".session")));
 }
 
+// Asks for the pin's full content height; fit_window caps it at the work
+// area, and the pin (max-height: 100vh) scrolls the rest.
 function fitWindow() {
   const rect = pin.getBoundingClientRect();
   const width = Math.ceil(rect.width);
-  const height = Math.ceil(rect.height);
+  const height = Math.ceil(pin.scrollHeight + (pin.offsetHeight - pin.clientHeight));
   const size = `${width}x${height}`;
   if (width <= 0 || height <= 0 || size === fittedSize) {
     return;
@@ -222,7 +238,7 @@ async function refresh() {
     approvals = [];
     console.warn("Unable to read approvals", approvalsResult.reason);
   }
-  decisions = pruneDecisions(decisions, approvals);
+  decisions = pruneDecisions(decisions, approvals, Date.now());
   renderRows(false);
 }
 
@@ -262,11 +278,21 @@ function renderRows(force) {
     agents.replaceChildren(placeholder("idle", "No active sessions", ""));
     return;
   }
-  // A rebuild replaces the buttons, so keep keyboard focus on the same one.
+  // A rebuild replaces the buttons and detail boxes, so keep keyboard focus
+  // on the same button and each detail box's scroll position.
   const focused = document.activeElement && document.activeElement.dataset
     ? document.activeElement.dataset.focusId
     : undefined;
+  const scrolls = new Map(
+    [...agents.querySelectorAll("[data-scroll-id]")].map((node) => [node.dataset.scrollId, node.scrollTop])
+  );
   agents.replaceChildren(...rows.map((row) => session(row, now)));
+  for (const node of agents.querySelectorAll("[data-scroll-id]")) {
+    const top = scrolls.get(node.dataset.scrollId);
+    if (top) {
+      node.scrollTop = top;
+    }
+  }
   if (focused) {
     const again = [...agents.querySelectorAll("[data-focus-id]")].find((node) => node.dataset.focusId === focused);
     if (again && !again.disabled) {
@@ -299,8 +325,15 @@ function session(row, now) {
   }
 
   const request = rowApproval(row, approvals);
+  const settled = request ? null : lingeringNote(row.key, decisions);
   if (request) {
-    node.appendChild(approvalStrip(request));
+    node.appendChild(approvalStrip(request, row.key));
+  } else if (settled) {
+    // The request is gone: its outcome alone, briefly, with no buttons.
+    const strip = el("div", "approval approval--settled");
+    strip.setAttribute("data-expanded-only", "");
+    strip.appendChild(approvalNote(settled));
+    node.appendChild(strip);
   }
 
   if (open) {
@@ -309,22 +342,15 @@ function session(row, now) {
   return node;
 }
 
-// Everything being approved (summary, then detail, wrapped, never clipped)
-// with Allow and Deny. Not inside .agent[data-key], so a click on it never
-// toggles the card.
-function approvalStrip(request) {
+// Everything being approved, with Allow and Deny right under the summary so
+// they stay on screen; the detail follows in a scroll box, wrapped, never
+// clipped. Not inside .agent[data-key], so a click never toggles the card.
+function approvalStrip(request, rowKey) {
   const view = decisionView(decisions.get(request.id));
   const node = el("div", "approval");
   node.setAttribute("data-expanded-only", "");
   const [summary, ...detail] = approvalLines(request);
   node.appendChild(el("div", "approval__summary", summary));
-  if (detail.length) {
-    const block = el("div", "approval__detail");
-    for (const line of detail) {
-      block.appendChild(el("div", "approval__detail-line", line));
-    }
-    node.appendChild(block);
-  }
   const actions = el("div", "approval__actions");
   for (const allow of [true, false]) {
     const button = el(
@@ -335,6 +361,7 @@ function approvalStrip(request) {
     button.type = "button";
     button.dataset.decide = allow ? "allow" : "deny";
     button.dataset.id = request.id;
+    button.dataset.rowKey = rowKey;
     button.dataset.focusId = `${request.id}:${button.dataset.decide}`;
     button.setAttribute("aria-label", approvalButtonLabel(allow, request));
     button.disabled = view.disabled;
@@ -342,11 +369,23 @@ function approvalStrip(request) {
   }
   node.appendChild(actions);
   if (view.note) {
-    const note = el("div", "approval__note", view.note);
-    note.setAttribute("role", "status");
-    node.appendChild(note);
+    node.appendChild(approvalNote(view.note));
+  }
+  if (detail.length) {
+    const block = el("div", "approval__detail");
+    block.dataset.scrollId = request.id;
+    for (const line of detail) {
+      block.appendChild(el("div", "approval__detail-line", line));
+    }
+    node.appendChild(block);
   }
   return node;
+}
+
+function approvalNote(text) {
+  const note = el("div", "approval__note", text);
+  note.setAttribute("role", "status");
+  return note;
 }
 
 function card(catchUp) {

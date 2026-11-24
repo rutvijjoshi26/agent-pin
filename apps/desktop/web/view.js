@@ -234,11 +234,12 @@ function approvalTitle(req) {
 }
 
 /**
- * A click's decision, from click until the poll after `decide` settles.
- * `settledMs` is null while `decide` is in flight.
+ * A click's decision on the row `rowKey`, kept until shortly after its
+ * request leaves read_approvals. `settledMs` is null while `decide` is in
+ * flight; `goneMs` is when its request was first seen gone, or null.
  */
-export function decisionStarted(allow, nowMs) {
-  return { allow, startedMs: nowMs, settledMs: null, failed: false };
+export function decisionStarted(allow, nowMs, rowKey = null) {
+  return { allow, rowKey, startedMs: nowMs, settledMs: null, failed: false, goneMs: null };
 }
 
 /** The decision once `decide` resolved. */
@@ -268,20 +269,55 @@ export function decisionView(decision) {
   return { disabled: true, note: decision.allow ? "Allowed" : "Denied" };
 }
 
+/** How long a decision's note stays after its request leaves the list. */
+export const SETTLED_NOTE_MS = 1500;
+
 /**
- * The decisions to keep after a poll that listed `approvals`: each one
- * stays, its buttons disabled and its outcome shown, until its request is
- * no longer listed. A decision is never re-enabled or changed.
+ * The decisions to keep after a poll at `nowMs` that listed `approvals`.
+ * Each one stays, its buttons disabled and its outcome shown, while its
+ * request is listed; once the request is gone its note alone stays for
+ * SETTLED_NOTE_MS (see lingeringNote). A decision is never re-enabled.
  */
-export function pruneDecisions(decisions, approvals) {
+export function pruneDecisions(decisions, approvals, nowMs) {
   const listed = new Set((Array.isArray(approvals) ? approvals : []).map((req) => req.id));
   const kept = new Map();
   for (const [id, decision] of decisions) {
     if (listed.has(id)) {
       kept.set(id, decision);
+      continue;
+    }
+    const goneMs = decision.goneMs ?? nowMs;
+    if (nowMs - goneMs < SETTLED_NOTE_MS) {
+      kept.set(id, decision.goneMs === goneMs ? decision : { ...decision, goneMs });
     }
   }
   return kept;
+}
+
+/**
+ * The note a row shows, without buttons, for its newest decision whose
+ * request has left the list; null when there is none.
+ */
+export function lingeringNote(rowKey, decisions) {
+  let newest = null;
+  for (const decision of decisions.values()) {
+    if (decision.rowKey !== rowKey || decision.goneMs === null) {
+      continue;
+    }
+    if (newest === null || decision.startedMs > newest.startedMs) {
+      newest = decision;
+    }
+  }
+  return newest ? decisionView(newest).note : null;
+}
+
+/**
+ * True when a press at `offsetX` (from the element's padding edge) is on
+ * its vertical scrollbar, right of its `clientWidth`. Such a press scrolls
+ * and must not start a window drag.
+ */
+export function onScrollbar(offsetX, clientWidth) {
+  return offsetX >= clientWidth;
 }
 
 function capitalize(id) {

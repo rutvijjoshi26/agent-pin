@@ -20,6 +20,11 @@ body {
 /* The pin sizes to its content; a ResizeObserver fits the window to it. */
 .pin {
   width: 220px;
+  /* fit_window caps the window at the work area; the rest scrolls. */
+  max-height: 100vh;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   box-sizing: border-box;
   padding: 10px 12px;
   color: rgba(255, 255, 255, 0.92);
@@ -348,6 +353,9 @@ body {
   color: rgba(255, 255, 255, 0.7);
 }
 .approval__detail {
+  max-height: 156px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 .approval__detail-line {
