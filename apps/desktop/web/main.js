@@ -1,6 +1,6 @@
 // DOM glue for the overlay. Display logic lives in view.js; all text from
 // rows is untrusted (prompts, commands, paths) and is set via textContent.
-import { ageText, catchUpLines, collisionText, statusMeta } from "./view.js";
+import { ageText, cardCatchUp, catchUpLines, collisionText, statusMeta } from "./view.js";
 
 const POLL_MS = 800;
 const INSTALLED_MESSAGE = "Run /hooks in Claude Code to review and trust the new hooks";
@@ -19,7 +19,11 @@ let expanded = true;
 let rows = [];
 let rowsError = null;
 let renderedSignature = "";
-const openKeys = new Set();
+// Open cards, keyed by row key, mapped to the row's catch_up as it was just
+// before mark_seen emptied the backend's since-seen lists.
+const openCards = new Map();
+let pointerDown = false;
+let renderPending = false;
 let integrations = null;
 let setupMessage = "";
 let installing = false;
@@ -51,16 +55,32 @@ agents.addEventListener("click", (event) => {
     return;
   }
   const key = row.dataset.key;
-  if (openKeys.has(key)) {
-    openKeys.delete(key);
+  if (openCards.has(key)) {
+    openCards.delete(key);
   } else {
-    openKeys.add(key);
+    const live = rows.find((r) => r.key === key);
+    openCards.set(key, live ? live.catch_up : null);
     invoke("mark_seen", { key })
       .then(refresh)
       .catch((error) => console.warn("Unable to mark seen", error));
   }
   renderRows(true);
 });
+
+// Hold rebuilds while a button is down on the rows, so a poll can't replace
+// the element under the pointer and swallow the click. The held rebuild runs
+// after the click has been dispatched.
+agents.addEventListener("pointerdown", () => {
+  pointerDown = true;
+});
+for (const type of ["pointerup", "pointercancel", "blur"]) {
+  window.addEventListener(type, () => {
+    pointerDown = false;
+    if (renderPending) {
+      setTimeout(() => renderRows(true), 0);
+    }
+  });
+}
 
 setupButton.addEventListener("click", async () => {
   installing = true;
@@ -112,20 +132,24 @@ async function refresh() {
 }
 
 function renderRows(force) {
+  if (pointerDown) {
+    renderPending = true;
+    return;
+  }
+  renderPending = false;
   const now = Date.now();
   const liveKeys = new Set(rows.map((row) => row.key));
-  for (const key of openKeys) {
+  for (const key of openCards.keys()) {
     if (!liveKeys.has(key)) {
-      openKeys.delete(key);
+      openCards.delete(key);
     }
   }
 
-  // Rebuild only when something visible changed, so a click is never
-  // interrupted by a poll replacing the row under the pointer.
+  // Rebuild only when something visible changed.
   const signature = JSON.stringify([
     rows,
     rows.map((row) => ageText(row.updated_ms, now)),
-    [...openKeys],
+    [...openCards.keys()],
     rowsError
   ]);
   if (!force && signature === renderedSignature) {
@@ -146,7 +170,7 @@ function renderRows(force) {
 
 function session(row, now) {
   const node = el("div", "session");
-  const open = openKeys.has(row.key);
+  const open = openCards.has(row.key);
   const status = row.quiet ? "quiet" : statusMeta(row.status).label;
   const head = agentRow(row.status, row.label, status, ageText(row.updated_ms, now));
   head.dataset.key = row.key;
@@ -168,7 +192,7 @@ function session(row, now) {
   }
 
   if (open) {
-    node.appendChild(card(row.catch_up));
+    node.appendChild(card(cardCatchUp(row.catch_up, openCards.get(row.key))));
   }
   return node;
 }
@@ -186,8 +210,9 @@ function card(catchUp) {
   return node;
 }
 
+// Not a .session, so dragging works on the placeholder row.
 function placeholder(statusName, label, secondary) {
-  const node = el("div", "session");
+  const node = el("div", "placeholder");
   node.appendChild(agentRow(statusName, label, "", secondary));
   return node;
 }

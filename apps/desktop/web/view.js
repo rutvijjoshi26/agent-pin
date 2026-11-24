@@ -58,6 +58,22 @@ export function catchUpLines(catchUp) {
   return lines;
 }
 
+/**
+ * What an open card shows. Marking a row seen empties the backend's
+ * since-seen lists, so the files and commands come from the snapshot taken
+ * when the card opened, while the asks stay live.
+ */
+export function cardCatchUp(live, snapshot) {
+  if (!snapshot) {
+    return live;
+  }
+  return {
+    ...(live || snapshot),
+    files_since_seen: snapshot.files_since_seen,
+    commands_since_seen: snapshot.commands_since_seen
+  };
+}
+
 /** "⚠ a.rs also edited by Codex · api", plus " (+N)" for N more; null if none. */
 export function collisionText(collisions) {
   if (!collisions || collisions.length === 0) {

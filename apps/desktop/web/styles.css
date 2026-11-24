@@ -65,7 +65,8 @@ body {
   gap: 6px;
 }
 
-.session {
+.session,
+.placeholder {
   min-width: 0;
 }
 

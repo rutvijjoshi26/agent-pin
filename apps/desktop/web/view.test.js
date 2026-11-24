@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { ageText, catchUpLines, collisionText, statusMeta } from "./view.js";
+import { ageText, cardCatchUp, catchUpLines, collisionText, statusMeta } from "./view.js";
 
 const NOW = 10_000_000_000;
 
@@ -108,4 +108,39 @@ test("statusMeta falls back to idle for unknown statuses", () => {
   assert.deepEqual(statusMeta("idle"), idle);
   assert.deepEqual(statusMeta("bogus"), idle);
   assert.deepEqual(statusMeta(undefined), idle);
+});
+
+test("cardCatchUp keeps snapshot since-seen lists and live asks", () => {
+  const snapshot = {
+    original_ask: "old ask",
+    current_ask: "old pending",
+    files_since_seen: ["/r/a.rs"],
+    commands_since_seen: [{ command: "make", ok: true, at_ms: 1 }],
+    unseen: true
+  };
+  const live = {
+    original_ask: "build it",
+    current_ask: "Bash: ls",
+    files_since_seen: [],
+    commands_since_seen: [],
+    unseen: false
+  };
+  assert.deepEqual(cardCatchUp(live, snapshot), {
+    original_ask: "build it",
+    current_ask: "Bash: ls",
+    files_since_seen: ["/r/a.rs"],
+    commands_since_seen: [{ command: "make", ok: true, at_ms: 1 }],
+    unseen: false
+  });
+});
+
+test("cardCatchUp without a snapshot is the live catch-up", () => {
+  const live = {
+    original_ask: "a",
+    current_ask: null,
+    files_since_seen: ["/x"],
+    commands_since_seen: [],
+    unseen: true
+  };
+  assert.deepEqual(cardCatchUp(live, undefined), live);
 });

@@ -14,9 +14,9 @@
       {
         "label": "main",
         "title": "Agent Pin",
-        "width": 180,
+        "width": 220,
         "height": 164,
-        "minWidth": 54,
+        "minWidth": 36,
         "minHeight": 70,
         "decorations": false,
         "transparent": true,
