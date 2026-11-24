@@ -174,7 +174,7 @@ fn prune_orphan_lock(sessions: &Path, stem: &str, path: &Path, max_age: Duration
 }
 
 /// True when `path`'s mtime is more than `max_age` before the system clock.
-fn older_than(path: &Path, max_age: Duration) -> bool {
+pub(crate) fn older_than(path: &Path, max_age: Duration) -> bool {
     fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
@@ -277,7 +277,7 @@ pub(crate) fn check_stem(stem: &str) -> io::Result<()> {
     if !ok {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("invalid session key: {stem:?}"),
+            "invalid id",
         ));
     }
     Ok(())
@@ -304,20 +304,49 @@ fn write_atomic(sessions: &Path, stem: &str, path: &Path, state: &SessionState) 
 /// it, then renames it over `path` (which must be in `dir`). The temp file
 /// is removed on failure.
 pub(crate) fn write_bytes_atomic(dir: &Path, name: &str, path: &Path, body: &[u8]) -> io::Result<()> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!("{name}.tmp-{}-{n}", std::process::id()));
-    let result = (|| {
-        let mut file = File::create(&tmp)?;
-        file.write_all(body)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, path)
-    })();
+    let tmp = temp_path(dir, name);
+    let result = write_synced(&mut File::create(&tmp)?, body).and_then(|()| fs::rename(&tmp, path));
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// Publishes `body` as `<dir>/<name>` only if nothing is there yet: writes a
+/// synced temp file and hard-links it into place (failing with
+/// `AlreadyExists` if the target exists), then removes the temp. Where hard
+/// links fail for another reason, falls back to `create_new` and writes the
+/// target directly (not atomic for readers).
+pub(crate) fn publish_new(dir: &Path, name: &str, body: &[u8]) -> io::Result<()> {
+    let path = dir.join(name);
+    let tmp = temp_path(dir, name);
+    let linked = write_synced(&mut File::create(&tmp)?, body).and_then(|()| fs::hard_link(&tmp, &path));
+    let _ = fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
+        Err(_) => {
+            let mut file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+            let result = write_synced(&mut file, body);
+            if result.is_err() {
+                drop(file);
+                let _ = fs::remove_file(&path);
+            }
+            result
+        }
+    }
+}
+
+/// A unique temp path `<dir>/<name>.tmp-<pid>-<n>`.
+fn temp_path(dir: &Path, name: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("{name}.tmp-{}-{n}", std::process::id()))
+}
+
+fn write_synced(file: &mut File, body: &[u8]) -> io::Result<()> {
+    file.write_all(body)?;
+    file.sync_all()
 }
 
 #[cfg(test)]

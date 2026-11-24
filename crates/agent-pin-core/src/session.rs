@@ -51,7 +51,7 @@ pub struct SessionState {
 }
 
 /// Max chars kept for any free-text or path field.
-pub(crate) const TEXT_MAX: usize = 200;
+const TEXT_MAX: usize = 200;
 /// Max chars kept for an edited file path (long enough that collision keys
 /// stay faithful).
 const PATH_MAX: usize = 400;
@@ -171,13 +171,17 @@ fn resume_unless_waiting(s: &mut SessionState, same_tool: bool, now_ms: i64) {
 }
 
 /// `"<tool>: <command or file_path>"`, cleaned, as stored in `pending`.
-pub(crate) fn pending_text(input: &HookInput) -> String {
+fn pending_text(input: &HookInput) -> String {
+    clean(&pending_raw(input), TEXT_MAX)
+}
+
+/// `"<tool>: <command or file_path>"`, uncleaned.
+pub(crate) fn pending_raw(input: &HookInput) -> String {
     let name = input.tool_name.as_deref().unwrap_or("Tool");
-    let pending = match input.command.as_ref().or(input.file_path.as_ref()) {
+    match input.command.as_ref().or(input.file_path.as_ref()) {
         Some(detail) => format!("{name}: {detail}"),
         None => name.to_owned(),
-    };
-    clean(&pending, TEXT_MAX)
+    }
 }
 
 /// The session's file key: `session_id` sanitized to `[A-Za-z0-9_-]`
@@ -200,7 +204,7 @@ pub fn session_key(input: &HookInput) -> String {
 
 /// Truncates to `max_chars` and replaces control characters with spaces,
 /// so stored text stays byte-bounded (no 6-byte `\uXXXX` JSON escapes).
-pub(crate) fn clean(s: &str, max_chars: usize) -> String {
+fn clean(s: &str, max_chars: usize) -> String {
     truncate(s, max_chars)
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })

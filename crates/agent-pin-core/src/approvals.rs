@@ -4,19 +4,20 @@
 //! refreshing `<state_dir>/app.alive`; `<state_dir>/approvals.off` turns
 //! the feature off.
 
+use std::collections::hash_map::RandomState;
 use std::fs;
+use std::hash::BuildHasher;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::input::{truncate, HookInput};
 use crate::rows::project;
-use crate::session::{clean, pending_text, TEXT_MAX};
-use crate::store::{check_stem, write_bytes_atomic};
+use crate::session::pending_raw;
+use crate::store::{check_stem, older_than, publish_new, write_bytes_atomic};
 
 /// How often [`wait`] polls for a decision.
 pub const POLL_MS: u64 = 200;
@@ -27,24 +28,31 @@ pub const WAIT_MS: i64 = 590_000;
 
 /// Max chars in a request's `detail` (including the trailing `…`).
 const DETAIL_MAX: usize = 4000;
+/// Max chars in a request's other text fields (including the trailing `…`).
+const TEXT_MAX: usize = 200;
+/// Temp files older than this are left over from a crash and swept.
+const TEMP_MAX_AGE: Duration = Duration::from_secs(60);
 /// The message Claude Code and Codex show for a deny.
 const DENY_MESSAGE: &str = "Denied from Agent Pin";
 
 /// One pending permission request, as stored in `<id>.req.json`.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Request {
-    /// `<provider>__<session_key>__<unix_ms>__<4 hex>`, `[A-Za-z0-9_-]+`.
+    /// `<provider>__<session_key>__<unix_ms>__<16 lowercase hex>`,
+    /// `[A-Za-z0-9_-]+`.
     pub id: String,
     pub provider: String,
     pub session_key: String,
-    /// The project basename of the session's cwd, or empty.
+    /// The project basename of the session's cwd, or empty. This and the
+    /// other text fields are at most 200 chars, with control and invisible
+    /// format characters removed.
     #[serde(default)]
     pub label_hint: String,
     pub tool_name: String,
     /// The session's pending text, e.g. `Bash: rm -rf build`.
     pub summary: String,
     /// Pretty-printed `tool_input`, at most 4000 chars, no control chars
-    /// other than newlines.
+    /// other than newlines and no invisible format characters.
     pub detail: String,
     pub created_ms: i64,
     pub deadline_ms: i64,
@@ -58,8 +66,10 @@ pub enum Behavior {
     Deny,
 }
 
-/// The decision file's contents.
+/// The decision file's contents. Anything else, extra fields included, is
+/// not a decision.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Decision {
     behavior: Behavior,
 }
@@ -117,11 +127,21 @@ pub fn set_enabled(dir: &Path, on: bool) -> io::Result<()> {
 
 /// Builds the request for a PermissionRequest hook event.
 pub fn new_request(provider: &str, session_key: &str, input: &HookInput, now_ms: i64) -> Request {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let suffix = random_suffix(
+        nanos,
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+        &RandomState::new(),
+    );
     let id = format!(
-        "{}__{}__{now_ms}__{:04x}",
+        "{}__{}__{now_ms}__{suffix:016x}",
         id_part(provider),
-        id_part(session_key),
-        random_u16()
+        id_part(session_key)
     );
     let detail = input
         .tool_input
@@ -133,11 +153,11 @@ pub fn new_request(provider: &str, session_key: &str, input: &HookInput, now_ms:
         provider: provider.to_owned(),
         session_key: session_key.to_owned(),
         label_hint: project(input.cwd.as_deref())
-            .map(|p| clean(&p, TEXT_MAX))
+            .map(|p| sanitize(&p, TEXT_MAX, false))
             .unwrap_or_default(),
-        tool_name: clean(input.tool_name.as_deref().unwrap_or("Tool"), TEXT_MAX),
-        summary: pending_text(input),
-        detail: clean_keep_newlines(&detail, DETAIL_MAX),
+        tool_name: sanitize(input.tool_name.as_deref().unwrap_or("Tool"), TEXT_MAX, false),
+        summary: sanitize(&pending_raw(input), TEXT_MAX, false),
+        detail: sanitize(&detail, DETAIL_MAX, true),
         created_ms: now_ms,
         deadline_ms: now_ms + WAIT_MS,
     }
@@ -150,73 +170,125 @@ fn id_part(s: &str) -> String {
         .collect()
 }
 
-/// 16 bits that differ between calls in one process (for 65536 calls) and
-/// probably between processes. Not cryptographic.
-fn random_u16() -> u16 {
-    static SEED: OnceLock<u64> = OnceLock::new();
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let seed = *SEED.get_or_init(|| {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        let x = nanos ^ (u64::from(std::process::id()) << 16);
-        // Fold the high bits down so the low 16 depend on all of them.
-        x ^ (x >> 16) ^ (x >> 32) ^ (x >> 48)
-    });
-    // An odd step makes consecutive counters distinct modulo 2^16.
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    seed.wrapping_add(n.wrapping_mul(0x9E37)) as u16
+/// 64 bits for an id suffix, std only and not cryptographic. `state` is a
+/// fresh `RandomState`, whose keys are randomly seeded per process (and
+/// differ per call within it), so two hook processes with the same clock,
+/// pid and counter still get different suffixes. A stack address adds
+/// ASLR entropy.
+fn random_suffix(nanos: u64, pid: u32, counter: u64, state: &RandomState) -> u64 {
+    let stack = &nanos as *const u64 as usize;
+    state.hash_one((nanos, pid, counter, stack))
 }
 
-/// Truncates to at most `max_chars` (counting the `…`) and replaces control
-/// characters other than `\n` with spaces.
-fn clean_keep_newlines(s: &str, max_chars: usize) -> String {
-    let cut = if s.chars().count() > max_chars {
-        truncate(s, max_chars.saturating_sub(1))
+/// Invisible Unicode format characters (zero-width and bidi controls) that
+/// could make the text shown on a card differ from what will run.
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{200b}'..='\u{200f}'
+        | '\u{202a}'..='\u{202e}'
+        | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{2069}'
+        | '\u{feff}')
+}
+
+/// Removes invisible format characters, replaces control characters with
+/// spaces (keeping `\n` when `keep_newlines`), then truncates to at most
+/// `max_chars` counting the trailing `…`.
+fn sanitize(s: &str, max_chars: usize, keep_newlines: bool) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !is_invisible(*c))
+        .map(|c| if c.is_control() && !(keep_newlines && c == '\n') { ' ' } else { c })
+        .collect();
+    if cleaned.chars().count() > max_chars {
+        truncate(&cleaned, max_chars.saturating_sub(1))
     } else {
-        s.to_owned()
-    };
-    cut.chars()
-        .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
-        .collect()
+        cleaned
+    }
 }
 
-/// Atomically writes `<dir>/approvals/<id>.req.json`, creating the
-/// approvals dir if needed. Rejects an id outside `[A-Za-z0-9_-]`.
+/// Publishes `<dir>/approvals/<id>.req.json`, creating the approvals dir
+/// if needed. Never replaces anything: fails with `AlreadyExists` when the
+/// request or a decision for its id already exists, so a stale decision can
+/// never answer a new request. Rejects an id outside `[A-Za-z0-9_-]`. The
+/// hook must not [`wait`] after an error.
 pub fn post(dir: &Path, r: &Request) -> io::Result<()> {
     check_stem(&r.id)?;
     let approvals = approvals_dir(dir);
     fs::create_dir_all(&approvals)?;
+    if fs::symlink_metadata(dec_path(dir, &r.id)).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "a decision already exists for this approval id",
+        ));
+    }
     let body = serde_json::to_vec(r).map_err(io::Error::other)?;
-    let name = format!("{}.req.json", r.id);
-    write_bytes_atomic(&approvals, &name, &approvals.join(&name), &body)
+    publish_new(&approvals, &format!("{}.req.json", r.id), &body)
 }
 
-/// Every readable, unexpired request, oldest first. Requests whose
-/// `deadline_ms` has passed are deleted (with any decision file).
-/// Unparsable files are skipped.
+/// Every valid, unexpired request, oldest first. Also sweeps
+/// `<dir>/approvals`, best effort:
+/// - expired requests (`deadline_ms` passed), with any decision file;
+/// - request files that do not parse, or whose content `id` is not their
+///   file stem;
+/// - decision files with no request that are older than [`WAIT_MS`];
+/// - temp files older than 60 s, and `<dir>/app.alive.tmp-*` likewise.
+///
+/// File ages are mtimes measured against the system clock.
 pub fn list_pending(dir: &Path, now_ms: i64) -> Vec<Request> {
-    let Ok(entries) = fs::read_dir(approvals_dir(dir)) else {
+    sweep_alive_temps(dir);
+    let approvals = approvals_dir(dir);
+    let Ok(entries) = fs::read_dir(&approvals) else {
         return Vec::new();
     };
-    let mut out: Vec<Request> = entries
+    let names: Vec<String> = entries
         .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".req.json"))
-        .filter_map(|e| fs::read(e.path()).ok())
-        .filter_map(|bytes| serde_json::from_slice::<Request>(&bytes).ok())
-        .filter(|r| {
-            if now_ms < r.deadline_ms {
-                return true;
-            }
-            if check_stem(&r.id).is_ok() {
-                remove_files(dir, &r.id);
-            }
-            false
-        })
+        .filter_map(|e| e.file_name().into_string().ok())
         .collect();
+    let mut out = Vec::new();
+    for name in &names {
+        let path = approvals.join(name);
+        if let Some(stem) = name.strip_suffix(".req.json") {
+            let bytes = match fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            match serde_json::from_slice::<Request>(&bytes) {
+                Ok(r) if r.id == stem && check_stem(stem).is_ok() => {
+                    if now_ms < r.deadline_ms {
+                        out.push(r);
+                    } else {
+                        remove_files(dir, stem);
+                    }
+                }
+                _ => {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        } else if let Some(stem) = name.strip_suffix(".dec.json") {
+            let orphan = !approvals.join(format!("{stem}.req.json")).exists();
+            if orphan && older_than(&path, Duration::from_millis(WAIT_MS as u64)) {
+                let _ = fs::remove_file(&path);
+            }
+        } else if name.contains(".tmp-") && older_than(&path, TEMP_MAX_AGE) {
+            let _ = fs::remove_file(&path);
+        }
+    }
     out.sort_by(|a, b| a.created_ms.cmp(&b.created_ms).then_with(|| a.id.cmp(&b.id)));
     out
+}
+
+/// Removes `<dir>/app.alive.tmp-*` files older than 60 s.
+fn sweep_alive_temps(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let is_temp = e.file_name().to_str().is_some_and(|n| n.starts_with("app.alive.tmp-"));
+        if is_temp && older_than(&e.path(), TEMP_MAX_AGE) {
+            let _ = fs::remove_file(e.path());
+        }
+    }
 }
 
 /// Atomically writes the decision for request `id`. Errors with
@@ -390,7 +462,7 @@ mod tests {
         let r = new_request("claude", "s1", &bash("rm -rf build"), T0);
         assert!(r.id.starts_with(&format!("claude__s1__{T0}__")), "{}", r.id);
         let hex = r.id.rsplit("__").next().unwrap();
-        assert_eq!(hex.len(), 4);
+        assert_eq!(hex.len(), 16);
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "{hex}");
         assert_eq!(r.provider, "claude");
         assert_eq!(r.session_key, "s1");
@@ -545,6 +617,7 @@ mod tests {
         for bad in ["../x", "a/b", "a\\b", "..", "", "a.b", "a b", "C:x"] {
             let err = decide(dir, bad, Behavior::Allow).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad}");
+            assert_eq!(err.to_string(), "invalid id", "{bad}");
         }
         let err = decide(dir, "claude__s1__1__abcd", Behavior::Allow).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
@@ -592,5 +665,183 @@ mod tests {
         assert_eq!(r.detail, "");
         assert_eq!(r.tool_name, "Tool");
         assert_eq!(r.label_hint, "");
+    }
+
+    fn set_age(path: &Path, age: Duration) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age).unwrap();
+    }
+
+    #[test]
+    fn post_refuses_existing_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let r = new_request("claude", "s1", &bash("ls"), T0);
+        post(dir, &r).unwrap();
+        let mut other = r.clone();
+        other.summary = "Bash: rm -rf /".to_owned();
+        let err = post(dir, &other).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(list_pending(dir, T0), vec![r.clone()], "first request kept");
+        let names: Vec<String> = fs::read_dir(dir.join("approvals"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, [format!("{}.req.json", r.id)], "no temp files left");
+    }
+
+    #[test]
+    fn post_refuses_preexisting_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let r = new_request("claude", "s1", &bash("ls"), T0);
+        fs::create_dir_all(dir.join("approvals")).unwrap();
+        fs::write(dec_path(dir, &r.id), r#"{"behavior":"deny"}"#).unwrap();
+        let err = post(dir, &r).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(!req_path(dir, &r.id).exists());
+    }
+
+    /// A decision written before the request was posted (an orphan from a
+    /// `decide` that raced a finished wait) must never release a hook.
+    #[test]
+    fn planted_decision_before_post_never_allows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_alive(dir, T0).unwrap();
+        let r = new_request("claude", "s1", &bash("ls"), T0);
+        fs::create_dir_all(dir.join("approvals")).unwrap();
+        fs::write(dec_path(dir, &r.id), r#"{"behavior":"allow"}"#).unwrap();
+        assert!(post(dir, &r).is_err(), "the hook gives up when post fails");
+        assert!(list_pending(dir, T0).is_empty(), "the app never shows it");
+    }
+
+    #[test]
+    fn ids_differ_across_fresh_process_state() {
+        use std::collections::hash_map::RandomState;
+        // Same clock, pid and a fresh counter, as two hook processes
+        // started in the same nanosecond would have.
+        let a = random_suffix(T0 as u64 * 1_000_000, 4242, 0, &RandomState::new());
+        let b = random_suffix(T0 as u64 * 1_000_000, 4242, 0, &RandomState::new());
+        assert_ne!(a, b);
+        let r = new_request("claude", "s1", &bash("ls"), T0);
+        let hex = r.id.rsplit("__").next().unwrap();
+        assert_eq!(hex.len(), 16);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "{hex}");
+    }
+
+    #[test]
+    fn list_pending_rejects_content_id_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let victim = new_request("claude", "victim", &bash("ls"), T0);
+        post(dir, &victim).unwrap();
+        // A file whose content claims another request's id, and one whose
+        // content id is not a valid stem.
+        let mut forged = new_request("claude", "s1", &bash("ls"), T0);
+        let forged_name = forged.id.clone();
+        forged.id = victim.id.clone();
+        fs::write(req_path(dir, &forged_name), serde_json::to_vec(&forged).unwrap()).unwrap();
+        let mut bad = new_request("claude", "s2", &bash("ls"), T0);
+        let bad_name = bad.id.clone();
+        bad.id = "../escape".to_owned();
+        fs::write(req_path(dir, &bad_name), serde_json::to_vec(&bad).unwrap()).unwrap();
+        assert_eq!(list_pending(dir, T0), vec![victim.clone()]);
+        assert!(!req_path(dir, &forged_name).exists());
+        assert!(!req_path(dir, &bad_name).exists());
+        assert!(req_path(dir, &victim.id).exists());
+    }
+
+    #[test]
+    fn list_pending_sweeps_orphans_garbage_and_temp_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let approvals = dir.join("approvals");
+        let live = new_request("claude", "live", &bash("ls"), T0);
+        post(dir, &live).unwrap();
+        decide(dir, &live.id, Behavior::Allow).unwrap();
+        let old = Duration::from_millis(WAIT_MS as u64 + 60_000);
+        set_age(&dec_path(dir, &live.id), old);
+        let orphan_old = dec_path(dir, "claude__gone__1__00000000000000aa");
+        let orphan_new = dec_path(dir, "claude__gone__2__00000000000000bb");
+        fs::write(&orphan_old, r#"{"behavior":"allow"}"#).unwrap();
+        fs::write(&orphan_new, r#"{"behavior":"allow"}"#).unwrap();
+        set_age(&orphan_old, old);
+        let garbage = req_path(dir, "claude__junk__1__00000000000000cc");
+        fs::write(&garbage, "{not json").unwrap();
+        let tmp_old = approvals.join("x.req.json.tmp-1-0");
+        let tmp_new = approvals.join("x.req.json.tmp-1-1");
+        let alive_tmp_old = dir.join("app.alive.tmp-1-0");
+        let alive_tmp_new = dir.join("app.alive.tmp-1-1");
+        for p in [&tmp_old, &tmp_new, &alive_tmp_old, &alive_tmp_new] {
+            fs::write(p, "").unwrap();
+        }
+        set_age(&tmp_old, Duration::from_secs(61));
+        set_age(&alive_tmp_old, Duration::from_secs(61));
+        assert_eq!(list_pending(dir, T0), vec![live.clone()]);
+        assert!(!orphan_old.exists(), "old orphan decision removed");
+        assert!(orphan_new.exists(), "recent orphan decision kept");
+        assert!(dec_path(dir, &live.id).exists(), "a live request's decision is kept");
+        assert!(!garbage.exists(), "unparsable request removed");
+        assert!(!tmp_old.exists() && tmp_new.exists());
+        assert!(!alive_tmp_old.exists() && alive_tmp_new.exists());
+    }
+
+    #[test]
+    fn decision_with_unknown_fields_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_alive(dir, T0).unwrap();
+        let r = new_request("claude", "s1", &bash("ls"), T0);
+        post(dir, &r).unwrap();
+        fs::write(dec_path(dir, &r.id), r#"{"behavior":"allow","updatedInput":{}}"#).unwrap();
+        assert_eq!(run_wait(dir, &r, T0, true, |_| {}).0, None);
+        assert!(!dec_path(dir, &r.id).exists());
+    }
+
+    #[test]
+    fn invisible_format_chars_stripped() {
+        let raw = serde_json::json!({
+            "cwd": "/r/we\u{202e}b",
+            "tool_name": "Ba\u{200b}sh",
+            "tool_input": {"command": "rm \u{202e}fdp.exe\u{2066}x\u{feff}"},
+        })
+        .to_string();
+        let r = new_request("claude", "s1", &HookInput::from_json(&raw).unwrap(), T0);
+        let invisible = |c: char| {
+            matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+        };
+        for (name, text) in [
+            ("summary", &r.summary),
+            ("detail", &r.detail),
+            ("label_hint", &r.label_hint),
+            ("tool_name", &r.tool_name),
+        ] {
+            assert!(!text.chars().any(invisible), "{name}: {text:?}");
+        }
+        assert_eq!(r.summary, "Bash: rm fdp.exex");
+        assert_eq!(r.label_hint, "web");
+        assert_eq!(r.tool_name, "Bash");
+    }
+
+    #[test]
+    fn text_fields_at_most_200_chars() {
+        let long = "y".repeat(500);
+        let raw = serde_json::json!({
+            "cwd": format!("/r/{long}"),
+            "tool_name": long,
+            "tool_input": {"command": long},
+        })
+        .to_string();
+        let r = new_request("claude", "s1", &HookInput::from_json(&raw).unwrap(), T0);
+        for (name, text) in [("summary", &r.summary), ("label_hint", &r.label_hint), ("tool_name", &r.tool_name)] {
+            assert_eq!(text.chars().count(), 200, "{name}");
+            assert!(text.ends_with('…'), "{name}");
+        }
+        // Exactly 200 chars is kept whole.
+        let exact = "z".repeat(200);
+        let input = HookInput { tool_name: Some(exact.clone()), ..HookInput::default() };
+        assert_eq!(new_request("claude", "s1", &input, T0).tool_name, exact);
     }
 }
