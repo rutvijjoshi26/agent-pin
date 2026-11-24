@@ -32,7 +32,9 @@ struct StdinBuf {
 
 /// `agent-pin hook <provider> <event>`: records one hook event. Waits on
 /// stdin for at most 2 s, then uses whatever bytes arrived (nothing arrived:
-/// nothing is recorded). Prints errors only to stderr and always exits 0.
+/// nothing is recorded). A PermissionRequest may then wait for a click in
+/// the app; only a clicked decision is printed to stdout. Prints errors only
+/// to stderr and always exits 0.
 fn hook(args: &[String]) -> ! {
     let shared = Arc::new((Mutex::new(StdinBuf::default()), Condvar::new()));
     let reader = Arc::clone(&shared);
@@ -73,22 +75,23 @@ fn hook(args: &[String]) -> ! {
     };
 
     if !input.is_empty() {
+        // `hook::run` prints a clicked decision (JSON plus a newline, then a
+        // flush) to stdout and errors to stderr, ignoring failed writes
+        // (`println!`/`eprintln!` would panic on a closed pipe), and catches
+        // its own panics; this outer catch covers the rest.
         let result = std::panic::catch_unwind(|| {
-            agent_pin_core::run_hook(
+            agent_pin_core::hook::run(
                 args,
                 input.as_slice(),
                 agent_pin_core::state_dir(),
                 agent_pin_lib::now_ms(),
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr(),
             )
         });
-        // `eprintln!` panics when stderr is closed; a failed write is ignored
-        // so the hook still exits 0.
-        let mut stderr = std::io::stderr();
-        let _ = match result {
-            Ok(Err(error)) => writeln!(stderr, "agent-pin: {error}"),
-            Err(_) => writeln!(stderr, "agent-pin: hook panicked"),
-            Ok(Ok(())) => Ok(()),
-        };
+        if result.is_err() {
+            let _ = writeln!(std::io::stderr(), "agent-pin: hook panicked");
+        }
     }
     // Exit explicitly so a reader thread stuck on stdin can't keep us alive.
     std::process::exit(0);
