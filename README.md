@@ -24,7 +24,7 @@ Agent Pin pulls that state out of the terminals and into one small window that s
   Now asking: <the current approval request>
   ```
 
-- **Collision warnings.** When two sessions edited the same file within 10 minutes, both rows say so. Sessions in the same project are told apart with a ` #xxxx` suffix (the first characters of the session id).
+- **Collision warnings.** When two sessions edited the same file within 10 minutes, both rows say so. Sessions of the same agent in the same project are told apart with a ` #xxxx` suffix (the first characters of the session id).
 
 ## Install
 
@@ -87,7 +87,7 @@ using Claude-style event names (`SessionStart`, `UserPromptSubmit`, `PreToolUse`
 
 ## Linux
 
-On Wayland, the compositor may not honor always-on-top or window positioning. The app detects a Wayland session and says so in its setup panel.
+On Wayland, the compositor may not honor always-on-top. The app detects a Wayland session and says so in its setup panel.
 
 ## Building from source
 

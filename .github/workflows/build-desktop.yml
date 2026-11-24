@@ -19,10 +19,18 @@ jobs:
         os:
           - macos-latest
           - windows-latest
+          - ubuntu-22.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          # AppImage bundling runs linuxdeploy, which needs FUSE 2 and `file`.
+          sudo apt-get install -y libfuse2 file
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -50,6 +58,8 @@ jobs:
             apps/desktop/src-tauri/target/release/bundle/**/*.dmg
             apps/desktop/src-tauri/target/release/bundle/**/*.msi
             apps/desktop/src-tauri/target/release/bundle/**/*.exe
+            apps/desktop/src-tauri/target/release/bundle/**/*.deb
+            apps/desktop/src-tauri/target/release/bundle/**/*.AppImage
 
   release:
     name: Publish GitHub Release
@@ -68,5 +78,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          mapfile -t files < <(find release-assets -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \) | sort)
+          mapfile -t files < <(find release-assets -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' -o -name '*.deb' -o -name '*.AppImage' \) | sort)
           gh release create "$TAG" "${files[@]}" --title "$TAG" --generate-notes
