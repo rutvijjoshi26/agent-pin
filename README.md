@@ -124,6 +124,7 @@ Hooks installed by an older Agent Pin show "<Agent> hooks need updating" in the 
 
 Approvals use only files, no sockets or signals, so they work the same way on macOS, Windows and Linux. The hook, the request and decision files, and the installer have tests that run in CI on all three. These parts have not been tested end to end on a real machine:
 
+- a real Claude Code or Codex session acting on the hook's Allow or Deny output (the tests check the JSON shape, not that either agent accepts it);
 - the Tauri app itself (its approval commands are only compile-checked in CI);
 - the hook's Allow or Deny output on Windows from the release build, which has no console window;
 - what happens to a card after you answer in an interactive terminal instead.
