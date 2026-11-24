@@ -45,6 +45,9 @@ pub struct HookInput {
     pub tool_name: Option<String>,
     pub file_path: Option<String>,
     pub command: Option<String>,
+    /// The raw `tool_input` when it is an object (shown with approval
+    /// requests).
+    pub tool_input: Option<Value>,
 }
 
 impl HookInput {
@@ -72,6 +75,7 @@ impl HookInput {
             tool_name: text(root.get("tool_name")),
             file_path: tool_field("file_path").or_else(|| tool_field("notebook_path")),
             command: tool_field("command"),
+            tool_input: tool_input.filter(|t| t.is_object()).cloned(),
         })
     }
 }

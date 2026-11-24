@@ -1,6 +1,7 @@
 //! Pure core logic for agent-pin: hook input parsing, provider ids and the
 //! per-session state machine and the on-disk session store.
 
+pub mod approvals;
 pub mod hook;
 pub mod install;
 pub mod input;

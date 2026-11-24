@@ -269,7 +269,7 @@ fn still_linked(_file: &File, path: &Path) -> bool {
 
 /// Accepts only non-empty stems of `[A-Za-z0-9_-]`, so a stem can never
 /// name a path outside the sessions dir on any platform.
-fn check_stem(stem: &str) -> io::Result<()> {
+pub(crate) fn check_stem(stem: &str) -> io::Result<()> {
     let ok = !stem.is_empty()
         && stem
             .chars()
@@ -296,13 +296,20 @@ fn read_state(path: &Path) -> io::Result<Option<SessionState>> {
 /// Writes `state` to a unique temp file in `sessions`, then renames it over
 /// `path`.
 fn write_atomic(sessions: &Path, stem: &str, path: &Path, state: &SessionState) -> io::Result<()> {
+    let body = serde_json::to_vec(state).map_err(io::Error::other)?;
+    write_bytes_atomic(sessions, &format!("{stem}.json"), path, &body)
+}
+
+/// Writes `body` to a unique temp file `<dir>/<name>.tmp-<pid>-<n>`, syncs
+/// it, then renames it over `path` (which must be in `dir`). The temp file
+/// is removed on failure.
+pub(crate) fn write_bytes_atomic(dir: &Path, name: &str, path: &Path, body: &[u8]) -> io::Result<()> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = sessions.join(format!("{stem}.json.tmp-{}-{n}", std::process::id()));
+    let tmp = dir.join(format!("{name}.tmp-{}-{n}", std::process::id()));
     let result = (|| {
-        let body = serde_json::to_vec(state).map_err(io::Error::other)?;
         let mut file = File::create(&tmp)?;
-        file.write_all(&body)?;
+        file.write_all(body)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&tmp, path)
