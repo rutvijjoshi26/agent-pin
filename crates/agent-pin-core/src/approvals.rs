@@ -25,7 +25,7 @@ pub const POLL_MS: u64 = 200;
 pub const ALIVE_MAX_AGE_MS: i64 = 3000;
 /// A request file whose mtime is older than this has no live hook behind
 /// it: a waiting hook refreshes it every [`POLL_MS`].
-pub const HOOK_STALE_MS: i64 = 3000;
+pub const HOOK_STALE_MS: i64 = 5000;
 /// The app's liveness file in the state dir.
 pub const ALIVE_FILE: &str = "app.alive";
 /// How long a request waits for a decision.
@@ -1094,8 +1094,10 @@ mod tests {
         post(dir, &live).unwrap();
         post(dir, &dead).unwrap();
         decide(dir, &dead.id, Behavior::Allow).unwrap();
-        set_age(&req_path(dir, &live.id), Duration::from_millis(HOOK_STALE_MS as u64 - 1000));
-        set_age(&req_path(dir, &dead.id), Duration::from_millis(HOOK_STALE_MS as u64 + 1000));
+        // A hook that paused 4 s is still alive; 6 s without a refresh is gone.
+        assert_eq!(HOOK_STALE_MS, 5000);
+        set_age(&req_path(dir, &live.id), Duration::from_millis(4000));
+        set_age(&req_path(dir, &dead.id), Duration::from_millis(6000));
         assert_eq!(list_pending(dir, T0), vec![live.clone()]);
         assert!(!req_path(dir, &dead.id).exists());
         assert!(!dec_path(dir, &dead.id).exists());

@@ -44,7 +44,7 @@
 ## Review Focus
 
 1. The app is not running, or crashes mid-wait: the agent gets its normal terminal prompt within about 3 s, and nothing is printed. Tests: Task 1 and Task 2.
-2. The user answers in the terminal instead: the hook is killed or keeps waiting, and the card must not keep offering a decision that no longer matters. Tests: Task 3 (stale cleanup when the row isn't WaitingApproval) and Task 1 (deadline).
+2. The user answers in the terminal instead. A card is dismissed when its hook stops refreshing the request file (about 5 s), when its row reaches Completed, Idle or Error, or at the deadline. After a terminal answer, the card may stay while the session keeps running; clicking it then has no effect. Whether Claude Code kills the hook after a terminal answer is unverified. Tests: Task 1 (hook liveness, deadline) and Task 3 (row-status cleanup).
 3. Two sessions wait at once: each card's buttons resolve only that session's request. Tests: Task 1 (ids) and Task 4 (view mapping).
 4. A malformed or foreign decision file, e.g. `{"behavior":"always"}` or garbage: no output, and the normal prompt appears. Test: Task 1.
 5. Reinstalling over an existing install converts the old async PermissionRequest entry to a sync one with a 600 s timeout, and keeps the user's hooks. Test: Task 2.
